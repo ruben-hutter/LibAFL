@@ -280,7 +280,15 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymQEMU {
     fn spawn_child(&mut self, target_bytes: OwnedSlice<'_, u8>) -> Result<Child, Error> {
         fs::write("cur_input", target_bytes.as_slice())?;
 
-        // Run the target through SymQEMU for dynamic concolic instrumentation
+        // Run the target through SymQEMU with rust_backend for dynamic concolic instrumentation
+        // SymQEMU is now built with AFL++ fork's rust_backend, which properly integrates with LibAFL
+        // The rust_backend C++ wrapper (libSymCCRtShared.so) translates _sym_* to _rsym_* calls
+        // The actual implementation is in LibAFL's Rust runtime (libSymRuntime.so)
+        
+        // Get the shared memory env var from parent and pass it to child
+        let shmem_env = env::var(DEFAULT_ENV_NAME)
+            .expect("Concolic shared memory env var not set in parent process");
+        
         Ok(Command::new("./qemu-x86_64")
             .arg("./target_main.out")
             .arg("cur_input")
@@ -288,7 +296,11 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymQEMU {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .env("SYMCC_INPUT_FILE", "cur_input")
-            .env("LD_PRELOAD", "../runtime/libSymRuntime.so")
+            // Add current directory AND runtime directory to library path
+            // Needed for both libSymCCRtShared.so and libSymRuntime.so
+            .env("LD_LIBRARY_PATH", ".:/home/device-admin/LibAFL/fuzzers/structure_aware/libfuzzer_simple_concolic/runtime/target/release")
+            // Pass the shared memory env var to the child so the runtime can communicate
+            .env(DEFAULT_ENV_NAME, shmem_env)
             .spawn()
             .expect("failed to start process"))
     }
@@ -309,7 +321,7 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymCC {
     fn spawn_child(&mut self, target_bytes: OwnedSlice<'_, u8>) -> Result<Child, Error> {
         fs::write("cur_input", target_bytes.as_slice())?;
 
-        // Run the target through SymQEMU for dynamic concolic instrumentation
+        // Run the target through SymCC for compile-time concolic instrumentation
         Ok(Command::new("./target_symcc.out")
             .arg("cur_input")
             .stdin(Stdio::null())
