@@ -1,4 +1,4 @@
-// build.rs
+// build.rs - Simplified version using AFL++ SymCC fork
 
 use std::{
     env,
@@ -22,89 +22,58 @@ fn build_dep_check(tools: &[&str]) {
     }
 }
 
-fn clone_and_build_symqemu(out_path: &Path, runtime_dir: &Path) -> PathBuf {
-    let repo_dir = out_path.join("symqemu_src");
+fn build_aflpp_symcc_runtime(symcc_src_path: &Path) -> PathBuf {
+    println!("Building AFL++ SymCC runtime with rust_backend...");
+    
+    // Use cmake to build the runtime with RUST_BACKEND=ON
+    // This is the canonical way LibAFL builds it
+    let runtime_build = cmake::Config::new(symcc_src_path.join("runtime"))
+        .define("RUST_BACKEND", "ON")
+        .define("Z3_TRUST_SYSTEM_VERSION", "ON")
+        .cxxflag("-Wno-error=deprecated-declarations")
+        .build();
+    
+    runtime_build.join("lib")
+}
 
-    if !repo_dir.exists() {
-        println!("Cloning SymQEMU...");
-        std::process::Command::new("git")
-            .args(["clone", "https://github.com/eurecom-s3/symqemu.git"])
-            .arg(&repo_dir)
-            .status()
-            .expect("Failed to clone SymQEMU");
-    }
-
-    println!("Updating SymQEMU submodules...");
-    let submodule_status = std::process::Command::new("git")
-        .current_dir(&repo_dir)
-        .args([
-            "submodule",
-            "update",
-            "--init",
-            "--recursive",
-            "subprojects/symcc-rt",
-        ])
-        .status()
-        .expect("Failed to update SymQEMU submodules");
-
-    if !submodule_status.success() {
-        println!("cargo:warning=Failed to initialize SymQEMU submodules");
+fn use_prebuilt_symqemu(_runtime_lib_dir: &Path) -> PathBuf {
+    // Use the pre-built SymQEMU from /home/device-admin/symqemu
+    // This is the forked version with integrated AFL++ runtime (rust_backend)
+    let symqemu_home = PathBuf::from("/home/device-admin/symqemu");
+    let symqemu_build = symqemu_home.join("build");
+    
+    println!("Using pre-built SymQEMU from: {:?}", symqemu_home);
+    
+    if !symqemu_build.exists() {
+        println!("cargo:warning=SymQEMU build directory not found at {:?}", symqemu_build);
+        println!("cargo:warning=Please build SymQEMU first: cd /home/device-admin/symqemu && meson configure build -Dsymcc_rt_backend=rust && ninja -C build");
         exit(1);
     }
-
-    let symqemu_build = repo_dir.join("build");
-
-    // Check if already built
-    if !symqemu_build.join("qemu-x86_64").exists() {
-        println!("Building SymQEMU (this may take a while)...");
-
-        let configure_status = std::process::Command::new("./configure")
-            .current_dir(&repo_dir)
-            .args([
-                "--target-list=x86_64-linux-user",
-                "--audio-drv-list=",
-                "--disable-gtk",
-                "--disable-vte",
-                "--disable-opengl",
-                "--disable-virglrenderer",
-                "--disable-sdl",
-                "--disable-werror",
-            ])
-            .status()
-            .expect("Failed to configure SymQEMU");
-
-        if !configure_status.success() {
-            println!("cargo:warning=SymQEMU configure step failed");
-            exit(1);
-        }
-
-        let build_status = std::process::Command::new("ninja")
-            .current_dir(&repo_dir)
-            .args(["-C", "build", "qemu-x86_64"])
-            .status()
-            .expect("Failed to build SymQEMU");
-
-        if !build_status.success() {
-            println!("cargo:warning=SymQEMU build step failed");
-            exit(1);
-        }
+    
+    let qemu_bin = symqemu_build.join("qemu-x86_64");
+    
+    if !qemu_bin.exists() {
+        println!("cargo:warning=qemu-x86_64 binary not found at {:?}", qemu_bin);
+        println!("cargo:warning=Please build SymQEMU first: cd /home/device-admin/symqemu && ninja -C build");
+        exit(1);
     }
-
-    // Use LibAFL's custom runtime instead of SymQEMU's built-in standard runtime
-    // This ensures SymQEMU communicates with LibAFL via shared memory
-    let runtime_src = runtime_dir.join("libSymRuntime.so");
-    if runtime_src.exists() {
-        if let Err(err) = std::fs::copy(&runtime_src, "libSymCCRtShared.so") {
-            println!(
-                "cargo:warning=Failed to copy LibAFL SymCC runtime library: {}",
-                err
-            );
-        }
+    
+    // Verify it's built with rust_backend by checking linked libraries
+    let ldd_output = std::process::Command::new("ldd")
+        .arg(&qemu_bin)
+        .output()
+        .expect("Failed to run ldd");
+    
+    let ldd_str = String::from_utf8_lossy(&ldd_output.stdout);
+    
+    if ldd_str.contains("libSymRuntime.so") {
+        println!("✓ qemu-x86_64 is linked with LibAFL rust_backend");
     } else {
-        println!("cargo:warning=LibAFL SymCC runtime not found. Build the runtime first.");
-        exit(1);
+        println!("cargo:warning=qemu-x86_64 exists but doesn't link to libSymRuntime.so");
+        println!("cargo:warning=It may be using the qsym backend instead of rust_backend");
+        println!("cargo:warning=Rebuild with: cd /home/device-admin/symqemu && meson configure build -Dsymcc_rt_backend=rust && ninja -C build");
     }
-
+    
     symqemu_build
 }
 
@@ -128,9 +97,9 @@ fn main() {
     println!("cargo:rerun-if-changed=harness_main.c");
     println!("cargo:rerun-if-changed=harness_symcc.c");
 
-    build_dep_check(&["clang", "clang++", "meson", "ninja", "pkg-config", "git"]);
+    build_dep_check(&["clang", "clang++", "cmake", "meson", "ninja", "pkg-config", "git"]);
 
-    // Set CC/CXX to clang once - used by cc::Build for harness.c and harness_main.c
+    // Set CC/CXX to clang once
     std::env::set_var("CC", "clang");
     std::env::set_var("CXX", "clang++");
 
@@ -173,7 +142,8 @@ fn main() {
         })
         .expect("failed to compile harness_main.c");
 
-    // === 3. Build the LibAFL SymCC runtime ===
+    // === 3. Build the LibAFL SymCC runtime (Rust implementation) ===
+    println!("Building LibAFL Rust runtime...");
     std::process::Command::new("cargo")
         .current_dir(&runtime_dir)
         .env_remove("CARGO_TARGET_DIR")
@@ -182,6 +152,7 @@ fn main() {
         .status()
         .expect("Failed to build runtime");
 
+    // Copy libSymRuntime.so to runtime directory for easier access
     std::fs::copy(
         runtime_dir
             .join("target")
@@ -189,28 +160,59 @@ fn main() {
             .join("libSymRuntime.so"),
         runtime_dir.join("libSymRuntime.so"),
     )
-    .unwrap();
+    .expect("Failed to copy libSymRuntime.so");
 
     if !runtime_dir.join("libSymRuntime.so").exists() {
         println!("cargo:warning=Runtime not found. Build it first.");
         exit(1);
     }
 
-    // === 4. Build SymQEMU ===
-    let symqemu_dir = clone_and_build_symqemu(&out_path, &runtime_dir);
-    let symqemu_bin = symqemu_dir.join("qemu-x86_64");
-    if symqemu_bin.exists() {
-        std::fs::copy(&symqemu_bin, "qemu-x86_64").expect("Failed to copy SymQEMU binary");
-    } else {
-        println!("cargo:warning=SymQEMU binary not found after build");
-        exit(1);
+    // === 4. Clone AFL++ SymCC fork (has rust_backend) ===
+    let symcc_src_dir = out_path.join("aflpp_symcc_src");
+    if !symcc_src_dir.exists() {
+        println!("Cloning AFL++ SymCC fork...");
+        symcc_libafl::clone_symcc(&symcc_src_dir);
     }
 
-    // === 5. Build SymCC and harness_symcc.c ===
-    let symcc_dir = clone_and_build_symcc(&out_path);
-    let symcc_bin = symcc_dir.join("symcc");
+    // === 5. Build AFL++ SymCC runtime with rust_backend ===
+    // This builds the C++ wrapper that translates _sym_* to _rsym_* calls
+    // and links it with our Rust runtime
+    let aflpp_runtime_lib = build_aflpp_symcc_runtime(&symcc_src_dir);
+    println!("AFL++ SymCC runtime built at: {:?}", aflpp_runtime_lib);
 
-    // Use SymCC directly without modifying CC/CXX environment variables
+    // Copy the built runtime library to our runtime directory
+    // The C++ runtime (libSymRuntime.a) contains the wrapper that calls into our Rust runtime
+    let symruntime_static = aflpp_runtime_lib.join("libSymRuntime.a");
+    if symruntime_static.exists() {
+        std::fs::copy(&symruntime_static, runtime_dir.join("libSymRuntime.a"))
+            .expect("Failed to copy libSymRuntime.a");
+        println!("Copied AFL++ SymCC runtime wrapper to runtime dir");
+    } else {
+        println!("cargo:warning=AFL++ SymCC runtime not found at {:?}", symruntime_static);
+    }
+
+    // === 6. Use pre-built SymQEMU with rust_backend ===
+    let symqemu_dir = use_prebuilt_symqemu(&runtime_dir);
+    let qemu_bin = symqemu_dir.join("qemu-x86_64");
+    
+    // Copy the binary to current directory
+    std::fs::copy(&qemu_bin, "qemu-x86_64")
+        .expect("Failed to copy qemu-x86_64");
+    println!("Copied qemu-x86_64 (with rust_backend) to current directory ✓");
+
+    // Copy libSymRuntime.so to current directory for SymQEMU runtime
+    std::fs::copy(
+        runtime_dir.join("libSymRuntime.so"),
+        "libSymRuntime.so",
+    )
+    .expect("Failed to copy libSymRuntime.so to current dir");
+
+    // === 7. Build SymCC compiler ===
+    let symcc_dir = symcc_libafl::build_symcc(&symcc_src_dir);
+    let symcc_bin = symcc_dir.join("symcc");
+    println!("SymCC compiler built at: {:?}", symcc_bin);
+
+    // Compile harness_symcc.c with SymCC
     let output = std::process::Command::new(&symcc_bin)
         .env("SYMCC_RUNTIME_DIR", &runtime_dir)
         .arg("-Wno-sign-compare")
@@ -231,14 +233,10 @@ fn main() {
             .expect("failed to write cc error message to stdout");
         exit(1);
     }
-}
 
-fn clone_and_build_symcc(out_path: &Path) -> PathBuf {
-    let repo_dir = out_path.join("libafl_symcc_src");
-    if !repo_dir.exists() {
-        // TODO: use similar approach as for SymQEMU to clone at specific commit
-        symcc_libafl::clone_symcc(&repo_dir);
-    }
-
-    symcc_libafl::build_symcc(&repo_dir)
+    println!("Build completed successfully!");
+    println!("- target_main.out: Plain binary for SymQEMU");
+    println!("- target_symcc.out: SymCC instrumented binary");
+    println!("- qemu-x86_64: SymQEMU with LibAFL rust_backend");
+    println!("- libSymRuntime.so: LibAFL Rust runtime");
 }
