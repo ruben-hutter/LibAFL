@@ -19,6 +19,16 @@ impl ConcolicMetadata {
         core::iter::from_fn(move || parser.next_message()).flatten()
     }
 
+    /// Returns the size of the internal buffer
+    pub fn buffer_size(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Returns true if the metadata buffer is empty (no symbolic data)
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
     pub(crate) fn from_buffer(buffer: Vec<u8>) -> Self {
         Self { buffer }
     }

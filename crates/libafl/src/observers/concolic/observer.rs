@@ -24,7 +24,15 @@ impl ConcolicObserver<'_> {
     pub fn create_metadata_from_current_map(&self) -> ConcolicMetadata {
         let reader = MessageFileReader::from_length_prefixed_buffer(self.map)
             .expect("constructing the message reader from a memory buffer should not fail");
-        ConcolicMetadata::from_buffer(reader.get_buffer().to_vec())
+        let buffer = reader.get_buffer().to_vec();
+        
+        // If the buffer is empty (length prefix was 0), the runtime didn't write
+        // any symbolic data. Return empty metadata instead of trying to parse.
+        if buffer.is_empty() {
+            return ConcolicMetadata::default();
+        }
+        
+        ConcolicMetadata::from_buffer(buffer)
     }
 }
 
