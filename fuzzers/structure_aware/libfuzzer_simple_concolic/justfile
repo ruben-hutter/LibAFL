@@ -1,5 +1,9 @@
 # Default recipe, runs when you just type `just`
-default: build
+default: list
+
+# List all available commands
+list:
+    @just --list
 
 # Build both projects
 build: build-runtime build-fuzzer
@@ -10,12 +14,22 @@ test: test-runtime test-fuzzer
 # Clean both projects
 clean: clean-runtime clean-fuzzer
 
+# Clean fuzzer artifacts (corpus, crashes, etc)
+clean-artifacts:
+    @echo "Cleaning fuzzer artifacts..."
+    @cd fuzzer && bash scripts/clean.sh
+    @echo "Cleanup complete!"
+
+# Full clean (cargo clean + artifacts)
+clean-all: clean clean-artifacts
+
 # --- Runtime Project ---
 
 # Build the runtime project
 build-runtime:
     @echo "Building the runtime project..."
     @cargo build --manifest-path runtime/Cargo.toml
+    @echo "Build complete!"
 
 # Test the runtime project (depends on it being built first)
 test-runtime: build-runtime
@@ -26,6 +40,7 @@ test-runtime: build-runtime
 clean-runtime:
     @echo "Cleaning runtime project..."
     @cargo clean --manifest-path runtime/Cargo.toml
+    @echo "Cleanup complete!"
 
 
 # --- Fuzzer Project ---
@@ -34,6 +49,7 @@ clean-runtime:
 build-fuzzer:
     @echo "Building the fuzzer project..."
     @cargo build --manifest-path fuzzer/Cargo.toml
+    @echo "Build complete!"
 
 # Test the fuzzer project (depends on it being built first)
 test-fuzzer: build-fuzzer
@@ -44,3 +60,9 @@ test-fuzzer: build-fuzzer
 clean-fuzzer:
     @echo "Cleaning fuzzer project..."
     @cargo clean --manifest-path fuzzer/Cargo.toml
+
+# --- Running the Fuzzer ---
+
+# Run the fuzzer using the run_fuzzing.sh script (args: num_regular num_concolic)
+run num_regular="2" num_concolic="1":
+    @cd fuzzer && bash scripts/run_fuzzing.sh {{num_regular}} {{num_concolic}}

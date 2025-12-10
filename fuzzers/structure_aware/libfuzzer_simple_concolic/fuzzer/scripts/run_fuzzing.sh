@@ -8,10 +8,10 @@ set -e
 
 # Default values
 NUM_REGULAR=${1:-2}      # Default: 2 regular fuzzing clients
-NUM_CONCOLIC=${2:-1}     # Default: 1 concolic client (with SymCC)
+NUM_CONCOLIC=${2:-1}     # Default: 1 concolic client
 
 SESSION_NAME="libafl_fuzz"
-FUZZER_BIN="./target/release/libfuzzer_simple_concolic"
+FUZZER_BIN="./target/debug/libfuzzer_simple_concolic"
 
 # Colors for output
 RED='\033[0;31m'
@@ -22,14 +22,14 @@ NC='\033[0m' # No Color
 
 echo -e "${GREEN}=== Starting LibAFL Fuzzing Setup ===${NC}"
 echo -e "${BLUE}Regular clients: ${NUM_REGULAR}${NC}"
-echo -e "${BLUE}Concolic clients: ${NUM_CONCOLIC} (using SymCC)${NC}"
+echo -e "${BLUE}Concolic clients: ${NUM_CONCOLIC}${NC}"
 echo ""
 
 # Check if binary exists
 if [ ! -f "$FUZZER_BIN" ]; then
     echo -e "${RED}Error: Fuzzer binary not found at $FUZZER_BIN${NC}"
     echo -e "${YELLOW}Building fuzzer...${NC}"
-    cargo build --release
+    cargo build
     if [ $? -ne 0 ]; then
         echo -e "${RED}Build failed!${NC}"
         exit 1
@@ -38,6 +38,13 @@ fi
 
 # Get current working directory
 WORK_DIR=$(pwd)
+
+# Create logs directory
+LOG_DIR="$WORK_DIR/logs"
+mkdir -p "$LOG_DIR"
+rm -f "$LOG_DIR"/*.log
+
+echo -e "${BLUE}Logs will be saved to: $LOG_DIR${NC}"
 
 # Clean up any existing session
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
@@ -50,9 +57,9 @@ fi
 echo -e "${GREEN}Creating tmux session '$SESSION_NAME'...${NC}"
 tmux new-session -d -s "$SESSION_NAME" -n "broker"
 
-# Start broker in first window
-echo -e "${YELLOW}Starting broker...${NC}"
-tmux send-keys -t "$SESSION_NAME:broker" "cd $WORK_DIR && $FUZZER_BIN" C-m
+# Start broker in first window with logging
+echo -e "${YELLOW}Starting broker... (log: $LOG_DIR/broker.log)${NC}"
+tmux send-keys -t "$SESSION_NAME:broker" "cd $WORK_DIR && $FUZZER_BIN > $LOG_DIR/broker.log 2>&1" C-m
 
 # Wait a bit for broker to start
 sleep 2
@@ -106,8 +113,8 @@ if [ $NUM_REGULAR -gt 0 ]; then
 
         pane_idx=0
         for i in $(seq $start_idx $end_idx); do
-            echo -e "${BLUE}  Starting regular client #$i (window $win, pane $pane_idx)${NC}"
-            create_pane "$window_name" $pane_idx "$FUZZER_BIN"
+            echo -e "${BLUE}  Starting regular client #$i (window $win, pane $pane_idx) (log: $LOG_DIR/regular_client_$i.log)${NC}"
+            create_pane "$window_name" $pane_idx "$FUZZER_BIN > $LOG_DIR/regular_client_$i.log 2>&1"
             pane_idx=$((pane_idx + 1))
             sleep 2
         done
@@ -117,7 +124,7 @@ if [ $NUM_REGULAR -gt 0 ]; then
     done
 fi
 
-# Start concolic clients (using SymCC)
+# Start concolic clients
 if [ $NUM_CONCOLIC -gt 0 ]; then
     echo -e "${YELLOW}Creating concolic clients (SymCC)...${NC}"
 
@@ -136,8 +143,8 @@ if [ $NUM_CONCOLIC -gt 0 ]; then
 
         pane_idx=0
         for i in $(seq $start_idx $end_idx); do
-            echo -e "${BLUE}  Starting concolic client #$i (window $win, pane $pane_idx)${NC}"
-            create_pane "$window_name" $pane_idx "$FUZZER_BIN --concolic --use-symcc"
+            echo -e "${BLUE}  Starting concolic client #$i (window $win, pane $pane_idx) (log: $LOG_DIR/concolic_client_$i.log)${NC}"
+            create_pane "$window_name" $pane_idx "$FUZZER_BIN --concolic > $LOG_DIR/concolic_client_$i.log 2>&1"
             pane_idx=$((pane_idx + 1))
             sleep 2
         done
