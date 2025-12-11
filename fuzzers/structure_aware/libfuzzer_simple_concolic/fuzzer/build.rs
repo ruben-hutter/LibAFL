@@ -63,13 +63,14 @@ fn use_prebuilt_symqemu(_runtime_lib_dir: &Path) -> PathBuf {
         .arg(&qemu_bin)
         .output()
         .expect("Failed to run ldd");
-    
+
     let ldd_str = String::from_utf8_lossy(&ldd_output.stdout);
-    
-    if ldd_str.contains("libSymRuntime.so") {
-        println!("✓ qemu-x86_64 is linked with LibAFL rust_backend");
+
+    // SymQEMU links to libSymCCRtShared.so (C++ wrapper), which then calls the Rust runtime
+    if ldd_str.contains("libSymCCRtShared.so") {
+        println!("✓ qemu-x86_64 is linked with LibAFL rust_backend (via libSymCCRtShared.so)");
     } else {
-        println!("cargo:warning=qemu-x86_64 exists but doesn't link to libSymRuntime.so");
+        println!("cargo:warning=qemu-x86_64 exists but doesn't link to libSymCCRtShared.so");
         println!("cargo:warning=It may be using the qsym backend instead of rust_backend");
         println!("cargo:warning=Rebuild with: cd /home/device-admin/symqemu && meson configure build -Dsymcc_rt_backend=rust && ninja -C build");
     }
@@ -109,7 +110,6 @@ fn main() {
         .flag("-Wno-sign-compare")
         .flag("-Wunused-but-set-variable")
         .flag("-O0")
-        .flag("-g")
         .file("./harness.c")
         .compile("harness");
 
@@ -123,7 +123,6 @@ fn main() {
         .flag("-Wno-sign-compare")
         .flag("-Wunused-but-set-variable")
         .flag("-O0")
-        .flag("-g")
         .cargo_metadata(false)
         .get_compiler()
         .to_command()
@@ -194,18 +193,20 @@ fn main() {
     // === 6. Use pre-built SymQEMU with rust_backend ===
     let symqemu_dir = use_prebuilt_symqemu(&runtime_dir);
     let qemu_bin = symqemu_dir.join("qemu-x86_64");
-    
+
     // Copy the binary to current directory
     std::fs::copy(&qemu_bin, "qemu-x86_64")
         .expect("Failed to copy qemu-x86_64");
-    println!("Copied qemu-x86_64 (with rust_backend) to current directory ✓");
+    println!("Copied qemu-x86_64 (with rust_backend) to current directory");
 
-    // Copy libSymRuntime.so to current directory for SymQEMU runtime
-    std::fs::copy(
-        runtime_dir.join("libSymRuntime.so"),
-        "libSymRuntime.so",
-    )
-    .expect("Failed to copy libSymRuntime.so to current dir");
+    // Copy libSymCCRtShared.so (C++ wrapper that qemu links to)
+    let symcc_rt_shared = symqemu_dir.join("subprojects/symcc-rt/libSymCCRtShared.so");
+    std::fs::copy(&symcc_rt_shared, "libSymCCRtShared.so")
+        .expect("Failed to copy libSymCCRtShared.so");
+    println!("Copied libSymCCRtShared.so (C++ wrapper) to current directory");
+
+    // Note: We don't copy libSymRuntime.so because libSymCCRtShared.so has a hardcoded
+    // RPATH to runtime/target/release/libSymRuntime.so, so it finds it automatically
 
     // === 7. Build SymCC compiler ===
     let symcc_dir = symcc_libafl::build_symcc(&symcc_src_dir);
@@ -218,7 +219,6 @@ fn main() {
         .arg("-Wno-sign-compare")
         .arg("-Wunused-but-set-variable")
         .arg("-O0")
-        .arg("-g")
         .arg("./harness_symcc.c")
         .args(["-o", "target_symcc.out"])
         .arg("-lm")

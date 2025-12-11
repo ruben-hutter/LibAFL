@@ -286,21 +286,25 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymQEMU {
         // The actual implementation is in LibAFL's Rust runtime (libSymRuntime.so)
         
         // Get the shared memory env var from parent and pass it to child
+        // LibAFL's Rust runtime uses SHARED_MEMORY_MESSAGES to find the shmem
         let shmem_env = env::var(DEFAULT_ENV_NAME)
             .expect("Concolic shared memory env var not set in parent process");
-        
+
         Ok(Command::new("./qemu-x86_64")
             .arg("./target_main.out")
             .arg("cur_input")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            // Use FileInput mode: SymQEMU will mark the contents of this file as symbolic
+            // MemoryInput mode would require explicit _sym_make_symbolic() calls in the target
             .env("SYMCC_INPUT_FILE", "cur_input")
-            // Add current directory AND runtime directory to library path
-            // Needed for both libSymCCRtShared.so and libSymRuntime.so
-            .env("LD_LIBRARY_PATH", ".:/home/device-admin/LibAFL/fuzzers/structure_aware/libfuzzer_simple_concolic/runtime/target/release")
-            // Pass the shared memory env var to the child so the runtime can communicate
-            .env(DEFAULT_ENV_NAME, shmem_env)
+            // NOTE: LD_LIBRARY_PATH not needed:
+            // - qemu-x86_64 finds libSymCCRtShared.so in current directory
+            // - libSymCCRtShared.so finds libSymRuntime.so via RPATH (hardcoded at build time)
+            //.env("LD_LIBRARY_PATH", ".:/home/device-admin/LibAFL/fuzzers/structure_aware/libfuzzer_simple_concolic/runtime/target/release")
+            // NOTE: DEFAULT_ENV_NAME also inherited automatically from parent, but explicit for clarity
+            .env(DEFAULT_ENV_NAME, &shmem_env)
             .spawn()
             .expect("failed to start process"))
     }
@@ -321,13 +325,21 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymCC {
     fn spawn_child(&mut self, target_bytes: OwnedSlice<'_, u8>) -> Result<Child, Error> {
         fs::write("cur_input", target_bytes.as_slice())?;
 
+        // Get the shared memory env var and pass it to child
+        let shmem_env = env::var(DEFAULT_ENV_NAME)
+            .expect("Concolic shared memory env var not set in parent process");
+
         // Run the target through SymCC for compile-time concolic instrumentation
         Ok(Command::new("./target_symcc.out")
             .arg("cur_input")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            // Use FileInput mode: SymCC will mark the contents of this file as symbolic
+            // MemoryInput mode would require explicit _sym_make_symbolic() calls in the target
             .env("SYMCC_INPUT_FILE", "cur_input")
+            // Pass shared memory ID for Rust runtime
+            .env(DEFAULT_ENV_NAME, &shmem_env)
             .spawn()
             .expect("failed to start process"))
     }

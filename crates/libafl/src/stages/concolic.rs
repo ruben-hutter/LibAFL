@@ -396,20 +396,30 @@ where
         let testcase = state.current_testcase()?.clone();
 
         let mutations = testcase.metadata::<ConcolicMetadata>().ok().map(|meta| {
+            println!("[SimpleConcolicMutationalStage] Found ConcolicMetadata");
+            let expr_count = meta.iter_messages().count();
+            println!("  Processing {} symbolic expressions", expr_count);
+
             start_timer!(state);
             let mutations = { generate_mutations(meta.iter_messages()) };
             mark_feature_time!(state, PerfFeature::Mutate);
+
+            println!("  Z3 generated {} mutations", mutations.len());
             mutations
         });
 
         if let Some(mutations) = mutations {
-            for mutation in mutations {
+            println!("[SimpleConcolicMutationalStage] Evaluating {} mutations", mutations.len());
+            for (idx, mutation) in mutations.iter().enumerate() {
                 let mut input_copy = state.current_input_cloned()?;
                 for (index, new_byte) in mutation {
-                    input_copy.mutator_bytes_mut()[index] = new_byte;
+                    input_copy.mutator_bytes_mut()[*index] = *new_byte;
                 }
+                println!("  Mutation {}/{}: changing {} bytes", idx + 1, mutations.len(), mutation.len());
                 fuzzer.evaluate_filtered(state, executor, manager, &input_copy)?;
             }
+        } else {
+            println!("[SimpleConcolicMutationalStage] No ConcolicMetadata found - skipping");
         }
         Ok(())
     }
