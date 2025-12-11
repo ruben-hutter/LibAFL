@@ -38,3 +38,4 @@ cc = { version = "1.1.22", features = ["parallel"] }
 cmake = "0.1.51"
 which = "6.0.3"
 symcc_libafl = { path = "../../../../crates/libafl_concolic/symcc_libafl" }
+symqemu_libafl = { path = "../../../../crates/libafl_concolic/symqemu_libafl" }

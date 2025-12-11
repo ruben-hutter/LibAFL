@@ -1,20 +1,53 @@
-# Hybrid Fuzzing for stb_image
+# Simple Concolic Fuzzer with SymQEMU and SymCC
 
-This folder contains an example hybrid fuzzer for stb_image using SymCC.
-It is based on the stb_image fuzzer that is also part of the examples.
-It has been tested on Linux only, as SymCC only works on linux.
+This folder contains a simple example of hybrid fuzzing using concolic execution with both SymQEMU (runtime instrumentation) and SymCC (compile-time instrumentation).
+
+It has been tested on Linux only, as SymCC and SymQEMU only work on Linux.
 
 The fuzzer itself is in the `fuzzer` directory and the concolic runtime lives in `runtime`.
 
-## Build
+## System Dependencies
 
-To build this example, run `cargo build --release` in the `runtime` and `fuzzer` directories separately (and in that order).
-This will build the fuzzer like it does in the stb_image case, but _additionally_ builds a version of the target that is instrumented with SymCC concolic instrumentation (`harness_symcc.c`).
-This separate version also doesn't conform to LibFuzzer's interface, but rather is a simple program that has the same behaviour as the LibFuzzer version (`harness.c`), because the SymCC runtime expects targets it's environment to be destroyed after a single execution (ie. it doesn't clean up it's resources).
-Building the separate concolic version of the target also requires a concolic runtime, which is part of the `runtime` folder.
-The build script of the fuzzer will check that the runtime has been built, but triggering the build command needs to be done manually (ie. run `cargo build (--release)` the runtime folder before building the fuzzer).
-The build script will also build SymCC.
-Therefore, all build depencies for SymCC should be available beforehand.
+Before building, ensure you have the following system dependencies installed:
+- clang and clang++ (LLVM 11 or later)
+- cmake
+- meson and ninja (for building SymQEMU)
+- pkg-config
+- git
+- Z3 solver (`libz3-dev` on Debian/Ubuntu)
+
+## Automated Build
+
+The build process is fully automated. Simply run:
+
+```bash
+cargo build --release
+```
+
+This single command will:
+1. Build the LibAFL Rust runtime for concolic execution
+2. Clone and build AFL++ SymCC fork with rust_backend
+3. Clone and build SymQEMU with rust_backend integration (on first build)
+4. Compile three versions of the target harness:
+   - `harness.c` - with sanitizer coverage for fuzzing
+   - `harness_main.c` - for SymQEMU runtime instrumentation
+   - `harness_symcc.c` - with SymCC compile-time instrumentation
+
+On first build, this may take 10-15 minutes as it clones and builds SymQEMU. Subsequent builds are much faster as everything is cached.
+
+### Using a Custom SymQEMU Build
+
+If you already have SymQEMU built elsewhere, you can skip the automatic clone/build by setting the `SYMQEMU_DIR` environment variable:
+
+```bash
+SYMQEMU_DIR=/path/to/your/symqemu cargo build --release
+```
+
+The build system will automatically:
+- Use your existing SymQEMU if already built
+- Build it if not already built
+- Rebuild it if the Rust runtime was updated
+- Verify it's configured with the rust_backend
 
 ## Run
 

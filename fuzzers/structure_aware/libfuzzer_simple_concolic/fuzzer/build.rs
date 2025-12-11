@@ -36,28 +36,53 @@ fn build_aflpp_symcc_runtime(symcc_src_path: &Path) -> PathBuf {
     runtime_build.join("lib")
 }
 
-fn use_prebuilt_symqemu(_runtime_lib_dir: &Path) -> PathBuf {
-    // Use the pre-built SymQEMU from /home/device-admin/symqemu
-    // This is the forked version with integrated AFL++ runtime (rust_backend)
-    let symqemu_home = PathBuf::from("/home/device-admin/symqemu");
+fn get_or_build_symqemu(out_path: &Path, runtime_lib_dir: &Path) -> PathBuf {
+    // Check if SYMQEMU_DIR environment variable is set
+    // Otherwise, use a cached version in the build output directory
+    let symqemu_home = if let Ok(symqemu_dir) = env::var("SYMQEMU_DIR") {
+        println!("Using SymQEMU from SYMQEMU_DIR: {}", symqemu_dir);
+        let path = PathBuf::from(symqemu_dir);
+        if !path.exists() {
+            println!("cargo:warning=SYMQEMU_DIR points to non-existent directory: {:?}", path);
+            exit(1);
+        }
+        path
+    } else {
+        let default_dir = out_path.join("symqemu");
+
+        // Clone SymQEMU if it doesn't exist
+        if !default_dir.exists() {
+            println!("SymQEMU not found, cloning from GitHub...");
+            println!("This is a one-time setup and may take a few minutes...");
+            symqemu_libafl::clone_symqemu(&default_dir);
+        } else {
+            println!("Using cached SymQEMU from: {:?}", default_dir);
+        }
+
+        default_dir
+    };
+
     let symqemu_build = symqemu_home.join("build");
-    
-    println!("Using pre-built SymQEMU from: {:?}", symqemu_home);
-    
-    if !symqemu_build.exists() {
-        println!("cargo:warning=SymQEMU build directory not found at {:?}", symqemu_build);
-        println!("cargo:warning=Please build SymQEMU first: cd /home/device-admin/symqemu && meson configure build -Dsymcc_rt_backend=rust && ninja -C build");
-        exit(1);
-    }
-    
     let qemu_bin = symqemu_build.join("qemu-x86_64");
-    
-    if !qemu_bin.exists() {
-        println!("cargo:warning=qemu-x86_64 binary not found at {:?}", qemu_bin);
-        println!("cargo:warning=Please build SymQEMU first: cd /home/device-admin/symqemu && ninja -C build");
-        exit(1);
+
+    // Build SymQEMU if not already built or if runtime was rebuilt
+    let runtime_lib = runtime_lib_dir.join("target/release/libSymRuntime.so");
+    let needs_rebuild = !qemu_bin.exists()
+        || (runtime_lib.exists() && qemu_bin.metadata().unwrap().modified().unwrap()
+            < runtime_lib.metadata().unwrap().modified().unwrap());
+
+    if needs_rebuild {
+        if !qemu_bin.exists() {
+            println!("Building SymQEMU with rust_backend...");
+            println!("This may take several minutes on first build...");
+        } else {
+            println!("Runtime was rebuilt, rebuilding SymQEMU...");
+        }
+        let _ = symqemu_libafl::build_symqemu(&symqemu_home);
+    } else {
+        println!("Using existing SymQEMU build at: {:?}", symqemu_build);
     }
-    
+
     // Verify it's built with rust_backend by checking linked libraries
     let ldd_output = std::process::Command::new("ldd")
         .arg(&qemu_bin)
@@ -72,9 +97,11 @@ fn use_prebuilt_symqemu(_runtime_lib_dir: &Path) -> PathBuf {
     } else {
         println!("cargo:warning=qemu-x86_64 exists but doesn't link to libSymCCRtShared.so");
         println!("cargo:warning=It may be using the qsym backend instead of rust_backend");
-        println!("cargo:warning=Rebuild with: cd /home/device-admin/symqemu && meson configure build -Dsymcc_rt_backend=rust && ninja -C build");
+        println!("cargo:warning=Rebuilding with rust_backend...");
+        // Rebuild with correct backend
+        let _ = symqemu_libafl::build_symqemu(&symqemu_home);
     }
-    
+
     symqemu_build
 }
 
@@ -190,8 +217,8 @@ fn main() {
         println!("cargo:warning=AFL++ SymCC runtime not found at {:?}", symruntime_static);
     }
 
-    // === 6. Use pre-built SymQEMU with rust_backend ===
-    let symqemu_dir = use_prebuilt_symqemu(&runtime_dir);
+    // === 6. Get or build SymQEMU with rust_backend ===
+    let symqemu_dir = get_or_build_symqemu(&out_path, &runtime_dir);
     let qemu_bin = symqemu_dir.join("qemu-x86_64");
 
     // Copy the binary to current directory

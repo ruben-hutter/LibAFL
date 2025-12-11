@@ -1,0 +1,14 @@
+[package]
+name = "symqemu_libafl"
+version = "0.15.4"
+authors = ["Ruben Hutter <ruben.hutter@fhnw.ch>"]
+edition = "2021"
+description = "Meta-package for LibAFL that provides helper functions to clone and build SymQEMU"
+
+[features]
+default = ["clone", "build"]
+clone = ["dep:which"]
+build = []
+
+[dependencies]
+which = { version = "6.0.3", optional = true }
