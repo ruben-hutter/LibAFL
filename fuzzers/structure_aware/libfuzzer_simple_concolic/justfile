@@ -5,8 +5,14 @@ default: list
 list:
     @just --list
 
-# Build both projects
-build: build-runtime build-fuzzer
+# Build both projects (release mode by default)
+build: build-release
+
+# Build both projects in release mode
+build-release: build-runtime-release build-fuzzer-release
+
+# Build both projects in debug mode
+build-dev: build-runtime-dev build-fuzzer-dev
 
 # Test both projects
 test: test-runtime test-fuzzer
@@ -25,14 +31,23 @@ clean-all: clean clean-artifacts
 
 # --- Runtime Project ---
 
-# Build the runtime project
-build-runtime:
-    @echo "Building the runtime project..."
+# Build the runtime project (release mode)
+build-runtime: build-runtime-release
+
+# Build the runtime project in release mode
+build-runtime-release:
+    @echo "Building the runtime project (release)..."
+    @cargo build --release --manifest-path runtime/Cargo.toml
+    @echo "Build complete!"
+
+# Build the runtime project in debug mode
+build-runtime-dev:
+    @echo "Building the runtime project (debug)..."
     @cargo build --manifest-path runtime/Cargo.toml
     @echo "Build complete!"
 
 # Test the runtime project (depends on it being built first)
-test-runtime: build-runtime
+test-runtime: build-runtime-release
     @echo "Running runtime tests..."
     @cargo test --manifest-path runtime/Cargo.toml
 
@@ -45,14 +60,23 @@ clean-runtime:
 
 # --- Fuzzer Project ---
 
-# Build the fuzzer project
-build-fuzzer:
-    @echo "Building the fuzzer project..."
+# Build the fuzzer project (release mode)
+build-fuzzer: build-fuzzer-release
+
+# Build the fuzzer project in release mode
+build-fuzzer-release:
+    @echo "Building the fuzzer project (release)..."
+    @cargo build --release --manifest-path fuzzer/Cargo.toml
+    @echo "Build complete!"
+
+# Build the fuzzer project in debug mode
+build-fuzzer-dev:
+    @echo "Building the fuzzer project (debug)..."
     @cargo build --manifest-path fuzzer/Cargo.toml
     @echo "Build complete!"
 
 # Test the fuzzer project (depends on it being built first)
-test-fuzzer: build-fuzzer
+test-fuzzer: build-fuzzer-release
     @echo "Running fuzzer tests..."
     @cargo test --manifest-path fuzzer/Cargo.toml
 
@@ -63,6 +87,10 @@ clean-fuzzer:
 
 # --- Running the Fuzzer ---
 
-# Run the fuzzer using the run_fuzzing.sh script (args: num_regular num_concolic)
-run num_regular="2" num_concolic="1":
-    @cd fuzzer && bash scripts/run_fuzzing.sh {{num_regular}} {{num_concolic}}
+# Run the fuzzer in release mode (args: num_regular num_concolic)
+run num_regular="2" num_concolic="1": build-release
+    @cd fuzzer && FUZZER_MODE=release bash scripts/run_fuzzing.sh {{num_regular}} {{num_concolic}}
+
+# Run the fuzzer in debug mode (args: num_regular num_concolic)
+run-dev num_regular="2" num_concolic="1": build-dev
+    @cd fuzzer && FUZZER_MODE=debug bash scripts/run_fuzzing.sh {{num_regular}} {{num_concolic}}
