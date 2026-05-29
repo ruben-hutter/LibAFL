@@ -25,33 +25,23 @@ NC='\033[0m' # No Color
 echo -e "${GREEN}=== Starting LibAFL Fuzzing Setup ===${NC}"
 echo -e "${BLUE}Build mode: ${BUILD_MODE}${NC}"
 echo -e "${BLUE}Regular clients: ${NUM_REGULAR}${NC}"
-echo -e "${BLUE}Concolic clients: ${NUM_CONCOLIC}${NC}"
+echo -e "${BLUE}Concolic clients (snapshot): ${NUM_CONCOLIC}${NC}"
 echo ""
 
-# Check if binary exists
-if [ ! -f "$FUZZER_BIN" ]; then
-    echo -e "${RED}Error: Fuzzer binary not found at $FUZZER_BIN${NC}"
-    echo -e "${YELLOW}Building fuzzer in ${BUILD_MODE} mode...${NC}"
-    if [ "$BUILD_MODE" = "release" ]; then
-        cargo build --release
-    else
-        cargo build
-    fi
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}Build failed!${NC}"
-        exit 1
-    fi
+# Always build with usermode feature (snapshot-based concolic is the default mode)
+echo -e "${YELLOW}Building fuzzer in ${BUILD_MODE} mode with usermode feature...${NC}"
+if [ "$BUILD_MODE" = "release" ]; then
+    cargo build --release --features usermode
+else
+    cargo build --features usermode
+fi
+if [ $? -ne 0 ]; then
+    echo -e "${RED}Build failed!${NC}"
+    exit 1
 fi
 
 # Get current working directory
 WORK_DIR=$(pwd)
-
-# Create logs directory
-#LOG_DIR="$WORK_DIR/logs"
-#mkdir -p "$LOG_DIR"
-#rm -f "$LOG_DIR"/*.log
-
-#echo -e "${BLUE}Logs will be saved to: $LOG_DIR${NC}"
 
 # Clean up any existing session
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
@@ -79,21 +69,16 @@ create_pane() {
     local cmd=$3
 
     if [ $pane_idx -eq 0 ]; then
-        # First pane already exists, just run command
         tmux send-keys -t "$SESSION_NAME:${window}.0" "cd $WORK_DIR && $cmd" C-m
     else
-        # Split the window and run command in the newly created pane
         if [ $pane_idx -eq 1 ]; then
-            # First split: vertical (left/right)
             tmux split-window -h -t "$SESSION_NAME:$window"
             tmux send-keys -t "$SESSION_NAME:$window" "cd $WORK_DIR && $cmd" C-m
         elif [ $pane_idx -eq 2 ]; then
-            # Second split: split left pane horizontally (top/bottom)
             tmux select-pane -t "$SESSION_NAME:${window}.0"
             tmux split-window -v -t "$SESSION_NAME:${window}.0"
             tmux send-keys -t "$SESSION_NAME:$window" "cd $WORK_DIR && $cmd" C-m
         else
-            # Third split: split right pane horizontally (top/bottom)
             tmux select-pane -t "$SESSION_NAME:${window}.1"
             tmux split-window -v -t "$SESSION_NAME:${window}.1"
             tmux send-keys -t "$SESSION_NAME:$window" "cd $WORK_DIR && $cmd" C-m
@@ -111,7 +96,6 @@ if [ $NUM_REGULAR -gt 0 ]; then
         window_name="regular_${win}"
         tmux new-window -t "$SESSION_NAME" -n "$window_name"
 
-        # Calculate how many clients in this window
         start_idx=$(( ($win - 1) * 4 + 1 ))
         end_idx=$(( $win * 4 ))
         if [ $end_idx -gt $NUM_REGULAR ]; then
@@ -126,14 +110,13 @@ if [ $NUM_REGULAR -gt 0 ]; then
             sleep 2
         done
 
-        # Balance the panes for even layout
         tmux select-layout -t "$SESSION_NAME:$window_name" tiled
     done
 fi
 
-# Start concolic clients
+# Start concolic clients (snapshot mode by default)
 if [ $NUM_CONCOLIC -gt 0 ]; then
-    echo -e "${YELLOW}Creating concolic clients (SymCC)...${NC}"
+    echo -e "${YELLOW}Creating concolic clients (SymQEMU snapshot)...${NC}"
 
     num_windows=$(( ($NUM_CONCOLIC + 3) / 4 ))  # Ceiling division
 
@@ -141,7 +124,6 @@ if [ $NUM_CONCOLIC -gt 0 ]; then
         window_name="concolic_${win}"
         tmux new-window -t "$SESSION_NAME" -n "$window_name"
 
-        # Calculate how many clients in this window
         start_idx=$(( ($win - 1) * 4 + 1 ))
         end_idx=$(( $win * 4 ))
         if [ $end_idx -gt $NUM_CONCOLIC ]; then
@@ -150,13 +132,12 @@ if [ $NUM_CONCOLIC -gt 0 ]; then
 
         pane_idx=0
         for i in $(seq $start_idx $end_idx); do
-            echo -e "${BLUE}  Starting concolic client #$i (window $win, pane $pane_idx)${NC}"
-            create_pane "$window_name" $pane_idx "$FUZZER_BIN --concolic"
+            echo -e "${BLUE}  Starting concolic snapshot client #$i (window $win, pane $pane_idx)${NC}"
+            create_pane "$window_name" $pane_idx "$FUZZER_BIN --concolic --use-snapshot"
             pane_idx=$((pane_idx + 1))
             sleep 2
         done
 
-        # Balance the panes for even layout
         tmux select-layout -t "$SESSION_NAME:$window_name" tiled
     done
 fi

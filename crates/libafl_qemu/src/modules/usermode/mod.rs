@@ -8,6 +8,11 @@ pub mod snapshot;
 #[cfg(not(cpu_target = "hexagon"))]
 pub use snapshot::{IntervalSnapshotFilter, SnapshotModule};
 
+#[cfg(all(feature = "usermode", not(cpu_target = "hexagon")))]
+pub mod concolic_snapshot;
+#[cfg(all(feature = "usermode", not(cpu_target = "hexagon")))]
+pub use concolic_snapshot::ConcolicSnapshotModule;
+
 #[cfg(not(cpu_target = "hexagon"))]
 pub mod asan_host;
 #[cfg(not(cpu_target = "hexagon"))]

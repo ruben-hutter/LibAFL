@@ -63,6 +63,10 @@ struct Opt {
     /// Use SymCC for concolic execution (default is SymQEMU)
     #[arg(long)]
     use_symcc: bool,
+
+    /// Use snapshot-based in-process concolic execution (requires QEMU usermode)
+    #[arg(long)]
+    use_snapshot: bool,
 }
 
 pub fn main() {
@@ -82,6 +86,7 @@ pub fn main() {
         1337,
         opt.concolic,
         opt.use_symcc,
+        opt.use_snapshot,
     )
     .expect("An error occurred while fuzzing");
 }
@@ -93,6 +98,7 @@ fn fuzz(
     broker_port: u16,
     concolic: bool,
     use_symcc: bool,
+    use_snapshot: bool,
 ) -> Result<(), Error> {
     // 'While the stats are state, they are usually used in the broker - which is likely never restarted
     let monitor = MultiMonitor::new(|s| println!("{s}"));
@@ -225,7 +231,24 @@ fn fuzz(
         let concolic_observer = ConcolicObserver::new("concolic", concolic_shmem.as_slice_mut());
         let concolic_ref = concolic_observer.handle();
 
-        if use_symcc {
+        if use_snapshot {
+            println!("Using SymQEMU snapshot-based concolic execution (in-process)");
+
+            let configurator = MyCommandConfiguratorSymQemuSnapshot::new();
+            let mut stages = tuple_list!(
+                ConcolicTracingStage::new(
+                    TracingStage::new(configurator.into_executor(
+                        tuple_list!(concolic_observer),
+                        None,
+                        None
+                    ),),
+                    concolic_ref,
+                ),
+                SimpleConcolicMutationalStage::new(),
+            );
+
+            fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut restarting_mgr)?;
+        } else if use_symcc {
             println!("Using SymCC for concolic execution");
             // The order of the stages matter!
             let mut stages = tuple_list!(
@@ -274,6 +297,51 @@ fn fuzz(
 }
 
 #[derive(Default, Debug)]
+pub struct MyCommandConfiguratorSymQemuSnapshot {
+    target_function: String,
+}
+
+impl MyCommandConfiguratorSymQemuSnapshot {
+    pub fn new() -> Self {
+        Self {
+            target_function: env::var("SNAPSHOT_TARGET_FUNCTION")
+                .unwrap_or_else(|_| "LLVMFuzzerTestOneInput".to_string()),
+        }
+    }
+}
+
+impl CommandConfigurator<Child> for MyCommandConfiguratorSymQemuSnapshot {
+    fn spawn_child(&mut self, target_bytes: OwnedSlice<'_, u8>) -> Result<Child, Error> {
+        fs::write("cur_input", target_bytes.as_slice())?;
+
+        let shmem_env = env::var(DEFAULT_ENV_NAME)
+            .expect("Concolic shared memory env var not set in parent process");
+
+        Ok(Command::new("./qemu-x86_64")
+            .arg("./target_main.out")
+            .arg("cur_input")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("SYMCC_INPUT_FILE", "cur_input")
+            .env(DEFAULT_ENV_NAME, &shmem_env)
+            .env("SYMCC_ENABLE_SNAPSHOT", "1")
+            .env("SYMCC_SNAPSHOT_TARGET_FUNCTION", &self.target_function)
+            .spawn()
+            .expect("failed to start SymQEMU snapshot process"))
+    }
+
+    fn exec_timeout(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+
+    fn exec_timeout_mut(&mut self) -> &mut Duration {
+        static mut TIMEOUT: Duration = Duration::from_secs(5);
+        unsafe { &mut TIMEOUT }
+    }
+}
+
+#[derive(Default, Debug)]
 pub struct MyCommandConfiguratorSymQEMU;
 
 impl CommandConfigurator<Child> for MyCommandConfiguratorSymQEMU {
@@ -314,7 +382,8 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymQEMU {
     }
 
     fn exec_timeout_mut(&mut self) -> &mut Duration {
-        todo!()
+        static mut TIMEOUT: Duration = Duration::from_secs(5);
+        unsafe { &mut TIMEOUT }
     }
 }
 
@@ -349,6 +418,7 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymCC {
     }
 
     fn exec_timeout_mut(&mut self) -> &mut Duration {
-        todo!()
+        static mut TIMEOUT: Duration = Duration::from_secs(5);
+        unsafe { &mut TIMEOUT }
     }
 }
