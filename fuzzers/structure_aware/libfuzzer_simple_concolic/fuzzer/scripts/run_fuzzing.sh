@@ -9,6 +9,7 @@ set -e
 # Default values
 NUM_REGULAR=${1:-2}      # Default: 2 regular fuzzing clients
 NUM_CONCOLIC=${2:-1}     # Default: 1 concolic client
+CONCOLIC_MODE=${3:-forkserver}  # Concolic mode: forkserver, separate, symcc
 
 # Build mode (can be set via FUZZER_MODE env var, defaults to release)
 BUILD_MODE=${FUZZER_MODE:-release}
@@ -25,15 +26,15 @@ NC='\033[0m' # No Color
 echo -e "${GREEN}=== Starting LibAFL Fuzzing Setup ===${NC}"
 echo -e "${BLUE}Build mode: ${BUILD_MODE}${NC}"
 echo -e "${BLUE}Regular clients: ${NUM_REGULAR}${NC}"
-echo -e "${BLUE}Concolic clients (snapshot): ${NUM_CONCOLIC}${NC}"
+echo -e "${BLUE}Concolic clients: ${NUM_CONCOLIC} (mode: ${CONCOLIC_MODE})${NC}"
 echo ""
 
-# Always build with usermode feature (snapshot-based concolic is the default mode)
-echo -e "${YELLOW}Building fuzzer in ${BUILD_MODE} mode with usermode feature...${NC}"
+# Build (no usermode feature needed for fork-server mode)
+echo -e "${YELLOW}Building fuzzer in ${BUILD_MODE} mode...${NC}"
 if [ "$BUILD_MODE" = "release" ]; then
-    cargo build --release --features usermode
+    cargo build --release
 else
-    cargo build --features usermode
+    cargo build
 fi
 if [ $? -ne 0 ]; then
     echo -e "${RED}Build failed!${NC}"
@@ -114,9 +115,27 @@ if [ $NUM_REGULAR -gt 0 ]; then
     done
 fi
 
-# Start concolic clients (snapshot mode by default)
+# Determine concolic command based on mode
+case "$CONCOLIC_MODE" in
+    forkserver)
+        CONCOLIC_CMD="$FUZZER_BIN --concolic --use-forkserver"
+        ;;
+    separate)
+        CONCOLIC_CMD="$FUZZER_BIN --concolic"
+        ;;
+    symcc)
+        CONCOLIC_CMD="$FUZZER_BIN --concolic --use-symcc"
+        ;;
+    *)
+        echo -e "${RED}Unknown concolic mode: ${CONCOLIC_MODE}${NC}"
+        echo "Valid modes: forkserver, separate, symcc"
+        exit 1
+        ;;
+esac
+
+# Start concolic clients
 if [ $NUM_CONCOLIC -gt 0 ]; then
-    echo -e "${YELLOW}Creating concolic clients (SymQEMU snapshot)...${NC}"
+    echo -e "${YELLOW}Creating concolic clients (${CONCOLIC_MODE} mode)...${NC}"
 
     num_windows=$(( ($NUM_CONCOLIC + 3) / 4 ))  # Ceiling division
 
@@ -132,8 +151,8 @@ if [ $NUM_CONCOLIC -gt 0 ]; then
 
         pane_idx=0
         for i in $(seq $start_idx $end_idx); do
-            echo -e "${BLUE}  Starting concolic snapshot client #$i (window $win, pane $pane_idx)${NC}"
-            create_pane "$window_name" $pane_idx "$FUZZER_BIN --concolic --use-snapshot"
+            echo -e "${BLUE}  Starting concolic client #$i (${CONCOLIC_MODE}, window $win, pane $pane_idx)${NC}"
+            create_pane "$window_name" $pane_idx "$CONCOLIC_CMD"
             pane_idx=$((pane_idx + 1))
             sleep 2
         done

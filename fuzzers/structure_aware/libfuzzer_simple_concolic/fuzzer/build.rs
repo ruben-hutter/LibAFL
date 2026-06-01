@@ -124,6 +124,7 @@ fn main() {
     println!("cargo:rerun-if-changed=harness.c");
     println!("cargo:rerun-if-changed=harness_main.c");
     println!("cargo:rerun-if-changed=harness_symcc.c");
+    println!("cargo:rerun-if-changed=harness_forkserver.c");
 
     build_dep_check(&["clang", "clang++", "cmake", "meson", "ninja", "pkg-config", "git"]);
 
@@ -167,6 +168,29 @@ fn main() {
             }
         })
         .expect("failed to compile harness_main.c");
+
+    // === 2b. Build harness_forkserver.c for SymQEMU fork-server mode ===
+    cc::Build::new()
+        .flag("-Wno-sign-compare")
+        .flag("-Wunused-but-set-variable")
+        .flag("-O0")
+        .cargo_metadata(false)
+        .get_compiler()
+        .to_command()
+        .arg("./harness_forkserver.c")
+        .args(["-o", "target_forkserver.out"])
+        .arg("-lm")
+        .output()
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(())
+            } else {
+                println!("cargo:warning=Building harness_forkserver.c failed");
+                stdout().write_all(&output.stderr).ok();
+                exit(1);
+            }
+        })
+        .expect("failed to compile harness_forkserver.c");
 
     // === 3. Build the LibAFL SymCC runtime (Rust implementation) ===
     println!("Building LibAFL Rust runtime...");
@@ -263,6 +287,7 @@ fn main() {
 
     println!("Build completed successfully!");
     println!("- target_main.out: Plain binary for SymQEMU");
+    println!("- target_forkserver.out: Fork-server binary for SymQEMU fork-server mode");
     println!("- target_symcc.out: SymCC instrumented binary");
     println!("- qemu-x86_64: SymQEMU with LibAFL rust_backend");
     println!("- libSymRuntime.so: LibAFL Rust runtime");

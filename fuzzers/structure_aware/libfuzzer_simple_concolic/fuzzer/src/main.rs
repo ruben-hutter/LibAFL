@@ -12,7 +12,8 @@ use libafl::{
     corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus},
     events::{setup_restarting_mgr_std, EventConfig},
     executors::{
-        command::CommandConfigurator, inprocess::InProcessExecutor, ExitKind, ShadowExecutor,
+        command::CommandConfigurator, inprocess::InProcessExecutor, Executor, ExitKind,
+        HasObservers, ShadowExecutor,
     },
     feedback_or,
     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
@@ -28,14 +29,14 @@ use libafl::{
             serialization_format::{DEFAULT_ENV_NAME, DEFAULT_SIZE},
             ConcolicObserver,
         },
-        CanTrack, TimeObserver,
+        CanTrack, ObserversTuple, TimeObserver,
     },
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::{
         ConcolicTracingStage, ShadowTracingStage, SimpleConcolicMutationalStage,
         StdMutationalStage, TracingStage,
     },
-    state::{HasCorpus, StdState},
+    state::{HasCorpus, HasExecutions, StdState},
     Error,
 };
 use libafl_bolts::{
@@ -43,7 +44,7 @@ use libafl_bolts::{
     ownedref::OwnedSlice,
     rands::StdRand,
     shmem::{ShMem, ShMemProvider, StdShMemProvider},
-    tuples::{tuple_list, Handled},
+    tuples::{tuple_list, Handled, MatchName, RefIndexable},
     AsSlice, AsSliceMut,
 };
 use libafl_targets::{
@@ -67,6 +68,10 @@ struct Opt {
     /// Use snapshot-based in-process concolic execution (requires QEMU usermode)
     #[arg(long)]
     use_snapshot: bool,
+
+    /// Use fork-server mode for faster SymQEMU concolic execution (reuses process)
+    #[arg(long)]
+    use_forkserver: bool,
 }
 
 pub fn main() {
@@ -84,9 +89,7 @@ pub fn main() {
         &[PathBuf::from("./corpus")],
         PathBuf::from("./crashes"),
         1337,
-        opt.concolic,
-        opt.use_symcc,
-        opt.use_snapshot,
+        &opt,
     )
     .expect("An error occurred while fuzzing");
 }
@@ -96,10 +99,10 @@ fn fuzz(
     corpus_dirs: &[PathBuf],
     objective_dir: PathBuf,
     broker_port: u16,
-    concolic: bool,
-    use_symcc: bool,
-    use_snapshot: bool,
+    opt: &Opt,
 ) -> Result<(), Error> {
+    let concolic = opt.concolic;
+    let use_symcc = opt.use_symcc;
     // 'While the stats are state, they are usually used in the broker - which is likely never restarted
     let monitor = MultiMonitor::new(|s| println!("{s}"));
 
@@ -231,7 +234,20 @@ fn fuzz(
         let concolic_observer = ConcolicObserver::new("concolic", concolic_shmem.as_slice_mut());
         let concolic_ref = concolic_observer.handle();
 
-        if use_snapshot {
+        if opt.use_forkserver {
+            println!("Using fork-server SymQEMU for concolic execution");
+
+            let fs_executor = ForkServerSymQEMUExecutor::new(tuple_list!(concolic_observer))?;
+            let mut stages = tuple_list!(
+                ConcolicTracingStage::new(
+                    TracingStage::new(fs_executor),
+                    concolic_ref,
+                ),
+                SimpleConcolicMutationalStage::new(),
+            );
+
+            fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut restarting_mgr)?;
+        } else if use_snapshot {
             println!("Using SymQEMU snapshot-based concolic execution (in-process)");
 
             let configurator = MyCommandConfiguratorSymQemuSnapshot::new();
@@ -394,20 +410,15 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymCC {
     fn spawn_child(&mut self, target_bytes: OwnedSlice<'_, u8>) -> Result<Child, Error> {
         fs::write("cur_input", target_bytes.as_slice())?;
 
-        // Get the shared memory env var and pass it to child
         let shmem_env = env::var(DEFAULT_ENV_NAME)
             .expect("Concolic shared memory env var not set in parent process");
 
-        // Run the target through SymCC for compile-time concolic instrumentation
         Ok(Command::new("./target_symcc.out")
             .arg("cur_input")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            // Use FileInput mode: SymCC will mark the contents of this file as symbolic
-            // MemoryInput mode would require explicit _sym_make_symbolic() calls in the target
             .env("SYMCC_INPUT_FILE", "cur_input")
-            // Pass shared memory ID for Rust runtime
             .env(DEFAULT_ENV_NAME, &shmem_env)
             .spawn()
             .expect("failed to start process"))
@@ -420,5 +431,101 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymCC {
     fn exec_timeout_mut(&mut self) -> &mut Duration {
         static mut TIMEOUT: Duration = Duration::from_secs(5);
         unsafe { &mut TIMEOUT }
+    }
+}
+
+fn wait_for_stop(child: &mut Child) -> Result<(), Error> {
+    let pid = child.id() as libc::pid_t;
+    let mut status: libc::c_int = 0;
+    let ret = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+    if ret < 0 {
+        return Err(Error::from("waitpid on fork-server failed"));
+    }
+    if libc::WIFSTOPPED(status) {
+        Ok(())
+    } else if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+        Err(Error::from("fork-server process exited unexpectedly"))
+    } else {
+        Err(Error::from("unexpected waitpid status"))
+    }
+}
+
+#[derive(Debug)]
+pub struct ForkServerSymQEMUExecutor<OT> {
+    child: Child,
+    observers: OT,
+}
+
+impl<OT> ForkServerSymQEMUExecutor<OT> {
+    pub fn new(observers: OT) -> Result<Self, Error> {
+        let shmem_env =
+            env::var(DEFAULT_ENV_NAME).expect("Concolic shmem env var not set in parent");
+
+        let mut child = Command::new("./qemu-x86_64")
+            .arg("./target_forkserver.out")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("SYMCC_INPUT_FILE", "cur_input")
+            .env(DEFAULT_ENV_NAME, &shmem_env)
+            .spawn()?;
+
+        eprintln!("[forkserver] waiting for initial SIGSTOP...");
+        wait_for_stop(&mut child)?;
+        eprintln!("[forkserver] fork-server ready");
+
+        Ok(Self { child, observers })
+    }
+}
+
+impl<OT> Drop for ForkServerSymQEMUExecutor<OT> {
+    fn drop(&mut self) {
+        eprintln!("[forkserver] killing fork-server process");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl<EM, I, OT, S, Z> Executor<EM, I, S, Z> for ForkServerSymQEMUExecutor<OT>
+where
+    OT: MatchName + ObserversTuple<I, S>,
+    S: HasExecutions,
+    Z: ToTargetBytes<I>,
+{
+    fn run_target(
+        &mut self,
+        fuzzer: &mut Z,
+        state: &mut S,
+        _mgr: &mut EM,
+        input: &I,
+    ) -> Result<ExitKind, Error> {
+        let bytes = fuzzer.to_target_bytes(input);
+        fs::write("cur_input", bytes.as_slice())?;
+
+        self.observers_mut().pre_exec_child_all(state, input)?;
+
+        let pid = self.child.id() as libc::pid_t;
+        let ret = unsafe { libc::kill(pid, libc::SIGCONT) };
+        if ret < 0 {
+            return Err(Error::from("SIGCONT to fork-server failed"));
+        }
+
+        wait_for_stop(&mut self.child)?;
+
+        let exit_kind = ExitKind::Ok;
+        self.observers_mut().post_exec_child_all(state, input, &exit_kind)?;
+        Ok(exit_kind)
+    }
+}
+
+impl<OT> HasObservers for ForkServerSymQEMUExecutor<OT> {
+    type Observers = OT;
+
+    fn observers(&self) -> RefIndexable<&Self::Observers, Self::Observers> {
+        RefIndexable::from(&self.observers)
+    }
+
+    fn observers_mut(&mut self) -> RefIndexable<&mut Self::Observers, Self::Observers> {
+        RefIndexable::from(&mut self.observers)
     }
 }
