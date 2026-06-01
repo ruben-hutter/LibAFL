@@ -18,7 +18,7 @@ use libafl::{
     feedback_or,
     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
-    inputs::{BytesInput, HasTargetBytes},
+    inputs::{BytesInput, HasTargetBytes, ToTargetBytes},
     monitors::MultiMonitor,
     mutators::{
         havoc_mutations::havoc_mutations, scheduled::HavocScheduledMutator,
@@ -247,7 +247,7 @@ fn fuzz(
             );
 
             fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut restarting_mgr)?;
-        } else if use_snapshot {
+        } else if opt.use_snapshot {
             println!("Using SymQEMU snapshot-based concolic execution (in-process)");
 
             let configurator = MyCommandConfiguratorSymQemuSnapshot::new();
@@ -439,14 +439,14 @@ fn wait_for_stop(child: &mut Child) -> Result<(), Error> {
     let mut status: libc::c_int = 0;
     let ret = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
     if ret < 0 {
-        return Err(Error::from("waitpid on fork-server failed"));
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "waitpid on fork-server failed").into());
     }
     if libc::WIFSTOPPED(status) {
         Ok(())
     } else if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-        Err(Error::from("fork-server process exited unexpectedly"))
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "fork-server process exited unexpectedly").into())
     } else {
-        Err(Error::from("unexpected waitpid status"))
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "unexpected waitpid status").into())
     }
 }
 
@@ -507,7 +507,7 @@ where
         let pid = self.child.id() as libc::pid_t;
         let ret = unsafe { libc::kill(pid, libc::SIGCONT) };
         if ret < 0 {
-            return Err(Error::from("SIGCONT to fork-server failed"));
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "SIGCONT to fork-server failed").into());
         }
 
         wait_for_stop(&mut self.child)?;
