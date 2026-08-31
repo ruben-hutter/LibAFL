@@ -12,6 +12,7 @@ Cargo.lock
 .DS_Store
 .env
 .vscode
+package-lock.json
 
 *.test
 *.tmp

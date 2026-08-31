@@ -1,0 +1,21 @@
+# PoC snapshot_runner — ISOLATED, not part of the fuzzer build pipeline.
+#
+# This is a proof-of-concept binary demonstrating the architecture for
+# snapshot-based symbolic execution with SymQEMU. It is intentionally
+# kept separate from the main fuzzer until module hooks are
+# production-ready. Do not add this to a workspace or reference it from
+# the fuzzer's build.
+[package]
+name = "snapshot_runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libafl = { path = "../../../../crates/libafl" }
+libafl_bolts = { path = "../../../../crates/libafl_bolts" }
+libafl_qemu = { path = "../../../../crates/libafl_qemu", features = ["usermode"] }
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
