@@ -61,46 +61,38 @@ executor.
 
 ## Phases
 
-### Phase 0 — Secure work (~30 min) [DONE see git log]
-- `.gitignore` for `snapshot_runner/target/`, stray artifacts
-  (`fuzzer/dummy_arg`, root `package-lock.json`).
-- Commit WIP (snapshot-mode plumbing + parser robustness fix) and untracked
-  sources (`fuzzer/harness_snapshot.c`, `snapshot_runner/` sources,
-  `MILESTONE_PLAN.md`).
-- Push branch (was: 1 unpushed commit + dirty tree).
+### Phase 0 — Secure work (~30 min) [DONE]
+### Phase 1 — Make libafl_qemu compile [DONE, d4045474]
+### Phase 2 — Hybrid QEMU tree [DONE]
+- qemu-hybrid/ = bridge 0bea78a (QEMU 10.0) + symqemu delta vs vanilla 9.1.1
+  (3-way applied, conflicts resolved; local git history documents everything).
+- Builds via libafl_qemu_build with LIBAFL_QEMU_DIR (see snapshot_runner/env.sh).
+- symcc-rt rust backend, _rsym_* intentionally unresolved (resolved by the host
+  process at load time). Configure needs: CC=clang CXX=clang++ (meson probes
+  clang, emits -Wthread-safety), symcc_rt_backend defaults to rust.
 
-### Phase 1 — Make libafl_qemu compile (~1-2 h)
-- Add `pub mod symqemu;` + re-export `SymQemuModule` in
-  `crates/libafl_qemu/src/modules/mod.rs`.
-- `cargo check -p libafl_qemu --features usermode`; fix fallout.
+### Phase 3a — SymQemuModule fixes [DONE]
+- FFI signature, g2h, no duplicate shmem, per-exec trace finalize (15981ac5).
 
-### Phase 2 — Hybrid QEMU tree (1-2 days; MAIN RISK)
-1. Rescue existing bridge clone out of `snapshot_runner/target/` (wiped by
-   cargo clean) into `qemu-hybrid/` at the fuzzer dir root.
-2. Generate symqemu patch: `git diff 3f5a25d3dc^2 HEAD` from a full symqemu
-   clone, excluding tests where convenient; include `subprojects/symcc-rt`
-   submodule + rust_backend CMake patch.
-3. Apply onto bridge tree; resolve conflicts (expected in `tcg/tcg-op*.c`,
-   `accel/tcg/tcg-runtime.c`, `include/tcg/tcg-op.h`).
-4. Configure bridge-style shared-lib build (`libqemu-x86_64.so`) with
-   SymQEMU's symbolic backend linked; validate with symqemu's
-   `tests/unit/check-sym-runtime.c`.
-5. Point builds at the hybrid via `LIBAFL_QEMU_DIR` (manage `QEMU_REVISION`).
+### Phase 3b — snapshot_runner real smoke test [DONE, 15981ac5]
+- PASSED: run-to-entry, snapshot, per-input restore+write+mark-symbolic+run,
+  4k+ symbolic expressions per execution, snapshot restore ~17us.
+- Key learnings: single runtime instance (host links libSymRuntime.so directly,
+  shim must NOT link it); trace length header needs explicit end/begin per
+  execution (this was also the root cause of the old empty-trace bug);
+  --dynamic-list/-E exports don't survive rust-lld + gc-sections for PIE.
 
-### Phase 3 — Executor integration (~0.5-1 day)
-- Fix `SymQemuModule` (FFI signature, `g2h()`, drop duplicate shmem init).
-- Replace spawn-child snapshot configurator with an in-process `Emulator`
-  executor using `ConcolicSnapshotModule` inside the existing
-  `ConcolicTracingStage`; `SYMCC_INPUT_FILE` must NOT be set in this mode.
-- Turn `snapshot_runner` into a real smoke test of the module.
+### Phase 3c — Fuzzer integration [IN PROGRESS]
+- Replace the spawn-child --use-snapshot configurator with the in-process
+  emulator flow (as in snapshot_runner/src/main.rs) inside ConcolicTracingStage.
+- Fuzzer needs: libafl_qemu dep (usermode+shared), link SymRuntime +
+  SymCCRtShared via build.rs rpaths (copy snapshot_runner/build.rs approach),
+  build with snapshot_runner/env.sh environment.
 
-### Phase 4 — End-to-end validation (~0.5 day)
-- `just run-snapshot` on `harness_snapshot.c` (nested conditions are concolic
-  bait): assert non-empty trace, Z3 solutions found, solutions reach
-  `foo()`'s return-1 path.
-- Compare exec/speed vs `forkserver` and `separate`; chase empty-trace root
-  cause if it persists.
+### Phase 4 — End-to-end validation (just run-snapshot)
+- Assert non-empty traces, Z3 solutions for foo()'s nested conditions,
+  compare exec/speed vs forkserver/separate modes.
 
 ### Fallback
 If Phase 2 merge fails badly, the committed fork-server mode is a
-demonstrable milestone on its own.
+demonstrable milestone on its own. (No longer needed.)
