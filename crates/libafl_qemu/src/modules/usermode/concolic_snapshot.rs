@@ -193,8 +193,8 @@ where
     fn pre_exec<ET>(
         &mut self,
         qemu: Qemu,
-        emulator_modules: &mut EmulatorModules<ET, I, S>,
-        state: &mut S,
+        _emulator_modules: &mut EmulatorModules<ET, I, S>,
+        _state: &mut S,
         input: &I,
     ) where
         ET: EmulatorModuleTuple<I, S>,

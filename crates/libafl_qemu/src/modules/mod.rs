@@ -46,6 +46,13 @@ pub use drcov::{DrCovMetadata, DrCovModule, DrCovModuleBuilder};
 pub mod logger;
 pub use logger::LoggerModule;
 
+/// SymQEMU integration for snapshot-based symbolic execution.
+/// Requires the hybrid QEMU build (LibAFL bridge + SymQEMU symbolic TCG).
+#[cfg(feature = "usermode")]
+pub mod symqemu;
+#[cfg(feature = "usermode")]
+pub use symqemu::SymQemuModule;
+
 pub mod utils;
 
 /// [`EmulatorModule`] is a trait designed to define modules that interact with the QEMU emulator
