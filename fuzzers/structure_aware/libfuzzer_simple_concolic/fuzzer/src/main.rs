@@ -334,7 +334,7 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymQemuSnapshot {
             .expect("Concolic shared memory env var not set in parent process");
 
         Ok(Command::new("./qemu-x86_64")
-            .arg("./target_main.out")
+            .arg("./target_snapshot.out")
             .arg("cur_input")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

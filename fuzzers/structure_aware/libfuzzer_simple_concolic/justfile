@@ -87,10 +87,15 @@ clean-fuzzer:
 
 # --- Running the Fuzzer ---
 
-# Run the fuzzer in release mode (args: num_regular num_concolic)
-run num_regular="2" num_concolic="1": build-release
-    @cd fuzzer && FUZZER_MODE=release bash scripts/run_fuzzing.sh {{num_regular}} {{num_concolic}}
+# Run the fuzzer in release mode (args: num_regular num_concolic [mode])
+# Modes: forkserver (default), snapshot, separate, symcc
+run num_regular="2" num_concolic="1" mode="forkserver": build-release
+    @cd fuzzer && FUZZER_MODE=release bash scripts/run_fuzzing.sh {{num_regular}} {{num_concolic}} {{mode}}
 
-# Run the fuzzer in debug mode (args: num_regular num_concolic)
-run-dev num_regular="2" num_concolic="1": build-dev
-    @cd fuzzer && FUZZER_MODE=debug bash scripts/run_fuzzing.sh {{num_regular}} {{num_concolic}}
+# Run the fuzzer in debug mode (args: num_regular num_concolic [mode])
+run-dev num_regular="2" num_concolic="1" mode="forkserver": build-dev
+    @cd fuzzer && FUZZER_MODE=debug bash scripts/run_fuzzing.sh {{num_regular}} {{num_concolic}} {{mode}}
+
+# Shortcut: snapshot concolic mode only (args: num_regular num_concolic)
+run-snapshot num_regular="0" num_concolic="1": build-release
+    @cd fuzzer && FUZZER_MODE=release bash scripts/run_fuzzing.sh {{num_regular}} {{num_concolic}} snapshot

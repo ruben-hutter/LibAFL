@@ -120,6 +120,9 @@ case "$CONCOLIC_MODE" in
     forkserver)
         CONCOLIC_CMD="$FUZZER_BIN --concolic --use-forkserver"
         ;;
+    snapshot)
+        CONCOLIC_CMD="$FUZZER_BIN --concolic --use-snapshot"
+        ;;
     separate)
         CONCOLIC_CMD="$FUZZER_BIN --concolic"
         ;;
@@ -128,7 +131,7 @@ case "$CONCOLIC_MODE" in
         ;;
     *)
         echo -e "${RED}Unknown concolic mode: ${CONCOLIC_MODE}${NC}"
-        echo "Valid modes: forkserver, separate, symcc"
+        echo "Valid modes: forkserver, snapshot, separate, symcc"
         exit 1
         ;;
 esac

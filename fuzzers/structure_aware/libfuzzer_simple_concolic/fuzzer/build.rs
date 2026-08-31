@@ -125,6 +125,7 @@ fn main() {
     println!("cargo:rerun-if-changed=harness_main.c");
     println!("cargo:rerun-if-changed=harness_symcc.c");
     println!("cargo:rerun-if-changed=harness_forkserver.c");
+    println!("cargo:rerun-if-changed=harness_snapshot.c");
 
     build_dep_check(&["clang", "clang++", "cmake", "meson", "ninja", "pkg-config", "git"]);
 
@@ -191,6 +192,29 @@ fn main() {
             }
         })
         .expect("failed to compile harness_forkserver.c");
+
+    // === 2c. Build harness_snapshot.c for SymQEMU snapshot mode ===
+    cc::Build::new()
+        .flag("-Wno-sign-compare")
+        .flag("-Wunused-but-set-variable")
+        .flag("-O0")
+        .cargo_metadata(false)
+        .get_compiler()
+        .to_command()
+        .arg("./harness_snapshot.c")
+        .args(["-o", "target_snapshot.out"])
+        .arg("-lm")
+        .output()
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(())
+            } else {
+                println!("cargo:warning=Building harness_snapshot.c failed");
+                stdout().write_all(&output.stderr).ok();
+                exit(1);
+            }
+        })
+        .expect("failed to compile harness_snapshot.c");
 
     // === 3. Build the LibAFL SymCC runtime (Rust implementation) ===
     println!("Building LibAFL Rust runtime...");

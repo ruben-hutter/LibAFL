@@ -62,11 +62,18 @@ pub struct MessageFileReader<R: Read> {
     reader: R,
     deserializer_config: Configuration,
     current_id: usize,
+    /// Set when an invalid relative reference is encountered during parsing.
+    /// Once set, [`next_message`] returns `None` to stop iteration, yielding a partial trace.
+    parse_error: bool,
 }
 
 impl<R: Read> Debug for MessageFileReader<R> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "MessageFileReader {{ current_id: {} }}", self.current_id)
+        write!(
+            f,
+            "MessageFileReader {{ current_id: {}, parse_error: {} }}",
+            self.current_id, self.parse_error
+        )
     }
 }
 
@@ -77,19 +84,26 @@ impl<R: Read> MessageFileReader<R> {
             reader,
             deserializer_config: serialization_options(),
             current_id: 1,
+            parse_error: false,
         }
     }
 
     /// Parse the next message out of the stream.
-    /// [`Option::None`] is returned once the stream is depleted.
+    /// [`Option::None`] is returned once the stream is depleted or if an invalid reference was encountered.
     /// IO and serialization errors are passed to the caller as [`DecodeError`].
     /// Finally, the returned tuple contains the message itself as a [`SymExpr`] and the [`SymExprRef`] associated
     /// with this message.
     /// The `SymExprRef` may be used by following messages to refer back to this message.
     pub fn next_message(&mut self) -> Option<Result<(SymExprRef, SymExpr), DecodeError>> {
+        if self.parse_error {
+            return None;
+        }
         match decode_from_std_read(&mut self.reader, self.deserializer_config) {
             Ok(mut message) => {
                 let message_id = self.transform_message(&mut message);
+                if self.parse_error {
+                    return None;
+                }
                 Some(Ok((message_id, message)))
             }
             Err(e) => match e {
@@ -106,14 +120,28 @@ impl<R: Read> MessageFileReader<R> {
 
     /// Makes the given `SymExprRef` absolute accoring to the `current_id` counter.
     /// See [`MessageFileWriter::make_relative`] for the inverse function.
-    fn make_absolute(&self, expr: SymExprRef) -> SymExprRef {
-        SymExprRef::new(self.current_id - expr.get()).unwrap()
+    /// Sets `parse_error` and returns a dummy if the reference is invalid (resolves to 0 or underflows).
+    fn make_absolute(&mut self, expr: SymExprRef) -> SymExprRef {
+        match self.current_id.checked_sub(expr.get()).and_then(SymExprRef::new) {
+            Some(abs) => abs,
+            None => {
+                log::warn!(
+                    "Invalid concolic trace reference: relative={}, current_id={} (resolves to invalid absolute id). Stopping trace parsing.",
+                    expr.get(),
+                    self.current_id
+                );
+                self.parse_error = true;
+                // Return a dummy valid ref; the parse_error flag will stop iteration
+                SymExprRef::new(1).unwrap()
+            }
+        }
     }
 
     /// This transforms the given message from it's serialized form into its in-memory form, making relative references
     /// absolute and counting the `SymExprRef`s.
     #[expect(clippy::too_many_lines)]
     fn transform_message(&mut self, message: &mut SymExpr) -> SymExprRef {
+        // Note: make_absolute may set self.parse_error; the caller (next_message) checks it.
         let ret = self.current_id;
         match message {
             SymExpr::InputByte { .. }

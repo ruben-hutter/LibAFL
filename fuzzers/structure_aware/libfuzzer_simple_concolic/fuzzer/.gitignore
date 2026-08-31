@@ -3,3 +3,6 @@ cur_input
 crash_input
 qemu-x86_64
 tmp_corpus
+dummy_arg
+*.so
+*.out
