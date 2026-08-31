@@ -40,6 +40,50 @@ fn with_state<R>(cb: impl FnOnce(&mut InnerRuntime) -> R) -> R {
     cb(s)
 }
 
+/// Finalize the current concolic trace: update the length header in shared memory.
+/// The host should then read the trace (e.g. via `ConcolicObserver`) and, before the
+/// next traced execution, call `_libafl_concolic_begin_trace` to start a fresh trace.
+#[no_mangle]
+pub unsafe extern "C" fn _libafl_concolic_end_trace() {
+    with_state(|rt| {
+        if let Some(tracing_rt) = rt.runtime_mut().runtime_mut().inner_mut() {
+            tracing_rt.finish();
+        }
+    });
+}
+
+/// Start a fresh concolic trace at the beginning of the shared memory region.
+/// Only valid after `_libafl_concolic_end_trace` (and after the host has read
+/// the finished trace).
+#[no_mangle]
+pub unsafe extern "C" fn _libafl_concolic_begin_trace() {
+    with_state(|rt| {
+        if let Some(tracing_rt) = rt.runtime_mut().runtime_mut().inner_mut() {
+            tracing_rt.begin();
+        }
+    });
+}
+
+/// Finalize the current concolic trace (update the length header in shared memory)
+/// and rewind the writer so the next execution starts a fresh trace.
+///
+/// This is exported for persistent (in-process) hosts: the host calls it after each
+/// traced execution, then reads the finished trace from the shared memory before
+/// starting the next execution. Out-of-process SymQEMU children never call this;
+/// their traces are finalized when the runtime is dropped at process exit.
+#[no_mangle]
+pub unsafe extern "C" fn _libafl_concolic_restart_trace() {
+    with_state(|rt| {
+        if let Some(tracing_rt) = rt
+            .runtime_mut()
+            .runtime_mut()
+            .inner_mut()
+        {
+            tracing_rt.restart();
+        }
+    });
+}
+
 // Manual exports matching the _rsym_* interface expected by libSymCCRtShared.so
 
 #[no_mangle]
@@ -534,8 +578,14 @@ pub unsafe extern "C" fn _rsym_expression_unreachable(
     with_state(|rt| rt.expression_unreachable(slice))
 }
 
-// C++ runtime exports (forwarded from cpp_runtime bindings)
-use symcc_runtime::cpp_runtime;
+// C++ runtime exports (forwarded from cpp_runtime bindings).
+// Only used by the standalone cdylib artifact; in-process (rlib) hosts get the
+// C++ shim directly from the symcc_runtime crate, and these re-exports would
+// clash with its symbols at link time.
+#[cfg(feature = "sym-wrappers")]
+pub mod sym_wrappers {
+    use super::*;
+    use symcc_runtime::cpp_runtime;
 
 #[no_mangle]
 pub unsafe extern "C" fn _sym_initialize() {
@@ -613,4 +663,5 @@ pub unsafe extern "C" fn _sym_read_memory(addr: *mut u8, length: usize, little_e
 #[no_mangle]
 pub unsafe extern "C" fn _sym_write_memory(addr: *mut u8, length: usize, expr: cpp_runtime::SymExpr, little_endian: bool) {
     cpp_runtime::_sym_write_memory(addr, length, expr, little_endian);
+}
 }

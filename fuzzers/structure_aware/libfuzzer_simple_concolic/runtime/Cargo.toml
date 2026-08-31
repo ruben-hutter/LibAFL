@@ -4,9 +4,18 @@ version = "0.15.4"
 edition = "2021"
 authors = ["Julius Hohnerlein <julihoh@users.noreply.github.com>"]
 
+[features]
+# Re-export the C++ shim's _sym_* functions from this crate (standalone cdylib
+# use). Disable for in-process (rlib) hosts: they link the C++ shim via the
+# symcc_runtime crate and the duplicate symbols would clash.
+default = ["sym-wrappers"]
+sym-wrappers = []
+
 [lib]
-# the runtime needs to be a shared object -> cdylib
-crate-type = ["cdylib"]
+# cdylib: loaded by out-of-process SymQEMU (spawned children)
+# rlib:   linked into in-process (libafl_qemu hybrid) hosts so that the
+#         _rsym_* symbols are exported from the host binary itself
+crate-type = ["cdylib", "rlib"]
 # this is necessary for SymCC to find the runtime.
 name = "SymRuntime"
 

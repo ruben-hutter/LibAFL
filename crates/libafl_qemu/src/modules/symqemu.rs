@@ -1,9 +1,13 @@
 //! Module for SymQEMU integration with snapshot-based symbolic execution
-
-use std::{cell::OnceCell, ffi::CString};
+//!
+//! This module is used together with the *hybrid* QEMU build (LibAFL bridge +
+//! SymQEMU symbolic TCG instrumentation, see `qemu-hybrid/`). The hybrid
+//! `libqemu-x86_64.so` links the SymCC C++ shim (`libSymCCRtShared.so`) whose
+//! `_rsym_*` symbols stay unresolved at build time and are provided by the host
+//! binary at load time (the host links the `runtime` crate from this fuzzer
+//! project as an rlib).
 
 use libafl::{executors::ExitKind, observers::ObserversTuple};
-use libafl_bolts::shmem::{ShMem, ShMemProvider, StdShMem, StdShMemProvider};
 use libafl_qemu_sys::GuestAddr;
 
 use crate::{
@@ -12,17 +16,21 @@ use crate::{
     modules::{EmulatorModule, EmulatorModuleTuple},
 };
 
-// FFI to SymCC runtime functions
-// Note: These will be provided by SymQEMU's runtime when loaded
+// FFI into the SymCC C++ shim (libSymCCRtShared.so, part of the hybrid QEMU build).
 unsafe extern "C" {
-    fn _sym_make_symbolic(addr: *const u8, size: usize, label: *const libc::c_char);
+    /// Marks `byte_length` bytes at host pointer `data` as symbolic input, with
+    /// `input_offset` being the index of the first byte within the symbolic input
+    /// (expression indices in the trace will match `input_offset + i`).
+    fn _sym_make_symbolic(data: *const core::ffi::c_void, byte_length: usize, input_offset: usize);
+    /// Provided by the `runtime` crate (rlib-linked into this very process):
+    /// finalize the current concolic trace and start a fresh one.
+    fn _libafl_concolic_restart_trace();
 }
 
 /// Module for managing snapshot-based symbolic execution with SymQEMU
 ///
-/// This module integrates LibAFL's snapshot functionality with SymQEMU's symbolic execution.
-/// It provides utilities to mark memory regions as symbolic and manage shared memory
-/// for constraint passing.
+/// It provides utilities to mark memory regions as symbolic between snapshot
+/// restores and to delimit per-execution concolic traces.
 #[derive(Debug)]
 pub struct SymQemuModule {
     /// Input buffer address in guest memory
@@ -30,9 +38,6 @@ pub struct SymQemuModule {
 
     /// Size of the input buffer
     input_buffer_size: usize,
-
-    /// Shared memory for constraint passing to SymCC runtime
-    runtime_shmem: OnceCell<StdShMem>,
 }
 
 impl SymQemuModule {
@@ -46,30 +51,38 @@ impl SymQemuModule {
         Self {
             input_buffer_addr: buffer_addr,
             input_buffer_size: buffer_size,
-            runtime_shmem: OnceCell::new(),
         }
     }
 
-    /// Mark the input buffer as symbolic using SymCC runtime
+    /// Mark the input buffer as symbolic using the SymCC runtime
     ///
-    /// This should be called after restoring a snapshot to mark the input
-    /// buffer as symbolic for SymQEMU to trace.
-    pub fn mark_buffer_symbolic(&self) {
+    /// This should be called after restoring a snapshot (and after writing the
+    /// concrete input bytes into the guest buffer). The guest address is
+    /// translated to the corresponding host pointer; the hybrid in-process build
+    /// maps guest RAM at host addresses, so the SymCC runtime's shadow memory
+    /// keyed by host pointer will match the addresses seen by TCG-generated
+    /// symbolic loads.
+    pub fn mark_buffer_symbolic(&self, qemu: Qemu) {
         log::info!(
             "Marking buffer at 0x{:x} (size: {}) as symbolic",
             self.input_buffer_addr,
             self.input_buffer_size
         );
 
-        let label = CString::new("input").expect("Failed to create label");
-
+        let host_ptr = qemu.g2h::<u8>(self.input_buffer_addr) as *const core::ffi::c_void;
         unsafe {
-            _sym_make_symbolic(
-                self.input_buffer_addr as *const u8,
-                self.input_buffer_size,
-                label.as_ptr(),
-            );
+            // input_offset = 0: expression indices in the concolic trace match
+            // the offsets within this buffer (and thus the fuzzer input).
+            _sym_make_symbolic(host_ptr, self.input_buffer_size, 0);
         }
+    }
+
+    /// Finalize the current concolic trace and start a fresh one.
+    ///
+    /// Call after each traced execution, before the host reads the trace from
+    /// the shared memory region.
+    pub fn restart_trace(&self) {
+        unsafe { _libafl_concolic_restart_trace() };
     }
 
     /// Get the buffer address
@@ -111,23 +124,12 @@ where
     ) where
         ET: EmulatorModuleTuple<I, S>,
     {
-        // Initialize shared memory for SymCC runtime
-        const DEFAULT_SIZE: usize = 0x100000; // 1MB for constraint trace
-        const DEFAULT_ENV_NAME: &str = "SHARED_MEMORY_MESSAGES";
-
-        let shmem = StdShMemProvider::new()
-            .expect("Failed to create shmem provider")
-            .new_shmem(DEFAULT_SIZE)
-            .expect("Failed to create shared memory");
-
-        unsafe {
-            shmem
-                .write_to_env(DEFAULT_ENV_NAME)
-                .expect("Failed to write shmem to env");
-        }
-
-        log::info!("Initialized shared memory for SymCC runtime");
-        self.runtime_shmem.set(shmem).ok();
+        // No shared-memory setup here: the host (fuzzer) creates the concolic
+        // shared memory and exports it via SHARED_MEMORY_MESSAGES before the
+        // emulator starts. The runtime (rlib-linked into this process) lazily
+        // attaches to it on first use. Creating a second region here would
+        // overwrite the host's environment variable.
+        log::info!("SymQemuModule active (using host-provided concolic shmem)");
     }
 
     fn post_exec<OT, ET>(
@@ -142,7 +144,9 @@ where
         OT: ObserversTuple<I, S>,
         ET: EmulatorModuleTuple<I, S>,
     {
-        // Nothing to do here for now
+        // Finalize the trace written during this execution and prepare a fresh
+        // one for the next run.
+        self.restart_trace();
     }
 }
 
@@ -151,7 +155,6 @@ impl Clone for SymQemuModule {
         Self {
             input_buffer_addr: self.input_buffer_addr,
             input_buffer_size: self.input_buffer_size,
-            runtime_shmem: OnceCell::new(),
         }
     }
 }

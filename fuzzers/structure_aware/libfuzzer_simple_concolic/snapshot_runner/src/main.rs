@@ -1,185 +1,216 @@
-//! Standalone runner for snapshot-based symbolic execution with SymQEMU
+//! Standalone smoke test for snapshot-based concolic execution with the
+//! hybrid QEMU (LibAFL bridge + SymQEMU symbolic TCG).
 //!
-//! This is a proof-of-concept tool that demonstrates the architecture for
-//! state-based symbolic execution. It shows how to:
-//! 1. Initialize QEMU with SnapshotModule and SymQemuModule
-//! 2. Prepare for snapshot capture at a specific address
-//! 3. Mark memory as symbolic after snapshot restore
+//! Flow:
+//! 1. Start the emulator on the guest binary and run to `LLVMFuzzerTestOneInput`
+//!    (breakpoint). The guest runs "normally" until this entry point.
+//! 2. Capture a full snapshot (CPU + RAM) via [`SnapshotModule`], remember the
+//!    input buffer (RDI), size (RSI), stack pointer and return address.
+//! 3. For each test input: restore the snapshot, write the input into the
+//!    guest buffer, mark it symbolic via the SymCC runtime, then resume
+//!    execution until the return-address breakpoint. The symbolic runtime
+//!    (rlib-linked into this process) writes a concolic trace into shared
+//!    memory; we read it back after every execution and report statistics.
 //!
-//! Current Status: PROOF OF CONCEPT
-//! - Modules are initialized correctly
-//! - Architecture is in place
-//! - Hook registration for snapshot point needs manual integration
-//!
-//! To test: cargo run --bin snapshot_runner
-
-use std::path::PathBuf;
+//! Build against the hybrid QEMU tree:
+//! ```sh
+//! export LIBAFL_QEMU_DIR=$PWD/../qemu-hybrid
+//! export LLVM_CONFIG_PATH=/usr/lib/llvm-20/bin/llvm-config
+//! export CC=clang CXX=clang++
+//! cargo run --release
+//! ```
 
 use clap::Parser;
+use libafl::observers::concolic::{
+    serialization_format::{DEFAULT_ENV_NAME, DEFAULT_SIZE}, ConcolicObserver,
+};
+use libafl_bolts::{
+    shmem::{ShMem, ShMemProvider, StdShMemProvider},
+    tuples::tuple_list, AsSliceMut,
+};
+use libafl_qemu::{
+    elf::EasyElf,
+    modules::{usermode::SnapshotModule, SymQemuModule},
+    Emulator, QemuExitError, QemuExitReason, Regs,
+};
+
+/// The `harness_snapshot.c` magic prefix that steers execution into `foo()`
+/// (nested comparisons that are only solvable with symbolic reasoning).
+const FOO_PREFIX: [u8; 4] = *b"QEMU";
+
+// Provided by libSymRuntime.so (linked as a shared dependency): a single
+// runtime instance serves both the SymCC shim inside libqemu-x86_64.so
+// (_rsym_* consumers) and our per-execution trace control.
+unsafe extern "C" {
+    fn _libafl_concolic_end_trace();
+    fn _libafl_concolic_begin_trace();
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "snapshot_runner")]
-#[command(about = "Proof-of-concept: SymQEMU snapshot-based symbolic execution")]
+#[command(about = "Snapshot-based concolic execution smoke test (hybrid SymQEMU bridge)")]
 struct Opt {
-    /// Target binary path
-    #[arg(short, long, default_value = "../fuzzer/target_main.out")]
-    binary: PathBuf,
+    /// Guest binary to run (built from harness_snapshot.c)
+    #[arg(short, long, default_value = "../fuzzer/target_snapshot.out")]
+    binary: String,
 
-    /// Snapshot address in hex (address just before foo() call - line 58 in harness_main.c)
-    #[arg(short, long)]
-    snapshot_addr: Option<String>,
-
-    /// Input buffer address (where malloc'd data lives)
-    #[arg(long)]
-    buffer_addr: Option<String>,
-
-    /// Input buffer size
-    #[arg(short = 'l', long, default_value = "16")]
-    buffer_size: usize,
+    /// Number of iterations after the initial (concrete) run
+    #[arg(short, long, default_value = "3")]
+    iterations: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let opt = Opt::parse();
+    assert!(
+        std::path::Path::new(&opt.binary).exists(),
+        "guest binary {:?} not found; build the fuzzer first (cargo build in ../fuzzer)",
+        opt.binary
+    );
 
-    println!("\n╔══════════════════════════════════════════════════════════════╗");
-    println!("║  SymQEMU Snapshot-Based Symbolic Execution - PROOF OF CONCEPT  ║");
-    println!("╚══════════════════════════════════════════════════════════════╝\n");
+    // The concolic shared memory this process (host of both the emulator and the
+    // symbolic runtime) reads the trace from.
+    let mut shmem_provider = StdShMemProvider::new()?;
+    let mut concolic_shmem = shmem_provider.new_shmem(DEFAULT_SIZE)?;
+    // SAFETY: the only place we set this env var; the rlib-linked runtime
+    // attaches to it lazily on the first _rsym_* call.
+    unsafe { concolic_shmem.write_to_env(DEFAULT_ENV_NAME)? };
 
-    println!("Binary: {}", opt.binary.display());
+    let qemu_args = vec![
+        "qemu-x86_64".to_string(),
+        opt.binary.clone(),
+        "dummy_input.bin".to_string(),
+    ];
 
-    // Check if binary exists
-    if !opt.binary.exists() {
-        eprintln!("❌ Error: Target binary not found: {}", opt.binary.display());
-        eprintln!("\n📝 To build the target:");
-        eprintln!("   cd ../fuzzer");
-        eprintln!("   cargo build");
-        eprintln!("\n   The target binary will be at: fuzzer/target_main.out\n");
-        return Ok(());
+    let builder =
+        Emulator::<(), _, _, (), libafl::inputs::BytesInput, (), _>::empty()
+        .qemu_parameters(qemu_args)
+        .modules(tuple_list!(
+            SnapshotModule::new(),
+            SymQemuModule::new(0, 4096)
+        ));
+    let mut emulator = builder.build()?;
+
+    let qemu = emulator.qemu();
+
+    let mut elf_buffer = Vec::new();
+    let elf = EasyElf::from_file(qemu.binary_path(), &mut elf_buffer)?;
+    let entry = elf
+        .resolve_symbol("LLVMFuzzerTestOneInput", qemu.load_addr())
+        .expect("LLVMFuzzerTestOneInput not found in guest binary");
+    log::info!("entry LLVMFuzzerTestOneInput @ {entry:#x}");
+
+    // === 1. Run normally until the entry point ===
+    qemu.set_breakpoint(entry);
+    unsafe {
+        match qemu.run() {
+            Ok(QemuExitReason::Breakpoint(_)) => {}
+            other => panic!("unexpected QEMU exit while running to entry: {other:?}"),
+        }
     }
 
-    println!("✓ Binary found\n");
+    let buffer: u64 = qemu.read_reg(Regs::Rdi).expect("read RDI").into();
+    let size: u64 = qemu.read_reg(Regs::Rsi).expect("read RSI").into();
+    let sp: u64 = qemu.read_reg(Regs::Sp).expect("read SP").into();
+    let mut ret_addr_buf = [0u8; 8];
+    qemu.read_mem(sp, &mut ret_addr_buf).expect("read ret addr");
+    let ret_addr = u64::from_le_bytes(ret_addr_buf);
+    log::info!("buffer={buffer:#x} size={size} sp={sp:#x} ret_addr={ret_addr:#x}");
 
-    // Parse addresses if provided
-    let snapshot_addr = if let Some(addr_str) = opt.snapshot_addr {
-        Some(parse_hex_addr(&addr_str)?)
-    } else {
-        None
-    };
+    // === 2. Capture the snapshot at the entry point ===
+    {
+        let modules = emulator.modules_mut();
+        let snapshot = modules.get_mut::<SnapshotModule>().unwrap();
+        snapshot.use_manual_reset();
+        snapshot.snapshot(qemu);
+        modules
+            .get_mut::<SymQemuModule>()
+            .unwrap()
+            .set_buffer_addr(buffer);
+    }
+    log::info!("snapshot captured at {entry:#x}");
 
-    let buffer_addr = if let Some(addr_str) = opt.buffer_addr {
-        Some(parse_hex_addr(&addr_str)?)
-    } else {
-        None
-    };
+    // From now on, stop at the return address of LLVMFuzzerTestOneInput.
+    qemu.remove_breakpoint(entry);
+    qemu.set_breakpoint(ret_addr);
 
-    if snapshot_addr.is_none() || buffer_addr.is_none() {
-        print_address_finding_help();
-        return Ok(());
+    let inputs: Vec<Vec<u8>> = vec![
+        // prefix steers into foo(); inner conditions unsolved -> deep constraints
+        [
+            &FOO_PREFIX[..],
+            &[0x11u8, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0] as &[u8],
+        ]
+        .concat(),
+        // solution-ish input for the first conditions of foo()
+        [
+            &FOO_PREFIX[..],
+            &[0u8, 0, 0, 0, 0x42, 0x13, 0x37, 0x10, 0x10, 0x10, 0xEF, 0] as &[u8],
+        ]
+        .concat(),
+        // goes to bar()
+        vec![0x00; 16],
+    ];
+
+    for (i, input) in inputs.iter().take(opt.iterations + 1).enumerate() {
+        log::info!(
+            "=== iteration {i}: input len={} {:02x?} ===",
+            input.len(),
+            input
+        );
+
+        // === 3a. restore snapshot ===
+        emulator
+            .modules_mut()
+            .get_mut::<SnapshotModule>()
+            .unwrap()
+            .reset(qemu);
+
+        // Start a fresh trace (the previous iteration's trace was consumed).
+        // SAFETY: runtime lives in this process.
+        if i > 0 {
+            unsafe { _libafl_concolic_begin_trace() };
+        }
+
+        // === 3b. write the input into the guest buffer ===
+        let len = input.len().min(size as usize).min(4096);
+        qemu.write_mem(buffer, &input[..len]).expect("write input to guest buffer");
+
+        // === 3c. mark the buffer symbolic (g2h translation inside the module) ===
+        emulator
+            .modules_mut()
+            .get_mut::<SymQemuModule>()
+            .unwrap()
+            .mark_buffer_symbolic(qemu);
+
+        // === 3d. resume execution until the return address ===
+        let start = std::time::Instant::now();
+        let exit = unsafe { qemu.run() };
+        let elapsed = start.elapsed();
+        let exit_kind = match exit {
+            Ok(QemuExitReason::Breakpoint(_)) => "return",
+            Ok(QemuExitReason::Crash) => "crash",
+            Ok(QemuExitReason::Timeout) => "timeout",
+            Err(QemuExitError::UnexpectedExit) => "unexpected-exit",
+            other => panic!("unexpected QEMU exit: {other:?}"),
+        };
+        log::info!("exit: {exit_kind} after {elapsed:?}");
+
+        // === 3e. finalize the trace and read it back ===
+        // SAFETY: the runtime lives in this process; finish updates the length
+        // header so the observer can read the trace of this execution.
+        unsafe { _libafl_concolic_end_trace() };
+
+        let mut observer = ConcolicObserver::new("concolic", concolic_shmem.as_slice_mut());
+        let metadata = observer.create_metadata_from_current_map();
+        let msgs = metadata.iter_messages().count();
+        log::info!("trace: {msgs} symbolic expressions");
+        assert!(
+            msgs > 0,
+            "concolic trace is empty: symbolic execution did not produce any expressions"
+        );
     }
 
-    let snapshot_addr = snapshot_addr.unwrap();
-    let buffer_addr = buffer_addr.unwrap();
-
-    println!("Configuration:");
-    println!("  Snapshot address: 0x{:x}", snapshot_addr);
-    println!("  Buffer address:   0x{:x}", buffer_addr);
-    println!("  Buffer size:      {} bytes", opt.buffer_size);
-    println!();
-
-    run_poc(
-        &opt.binary,
-        snapshot_addr,
-        buffer_addr,
-        opt.buffer_size,
-    )?;
-
-    Ok(())
-}
-
-fn parse_hex_addr(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    let s = s.trim_start_matches("0x");
-    Ok(u64::from_str_radix(s, 16)?)
-}
-
-fn print_address_finding_help() {
-    println!("❌ Missing required addresses\n");
-    println!("You must provide:");
-    println!("  --snapshot-addr <address>  Address just before foo() call (line 58)");
-    println!("  --buffer-addr <address>    Address where input data buffer lives\n");
-
-    println!("📝 How to find these addresses:\n");
-
-    println!("1️⃣  Find snapshot address (instruction just before `return foo(data, ptr);`):");
-    println!("   objdump -d ../fuzzer/target_main.out | grep -A 30 '<main>:'");
-    println!("   Look for the call instruction to 'foo' and note the address BEFORE it\n");
-
-    println!("2️⃣  Find buffer address (runtime - changes each execution):");
-    println!("   For now, you can use a placeholder like 0x7fffffffe000");
-    println!("   In the future, we'll automatically track malloc'd addresses\n");
-
-    println!("Example usage:");
-    println!("   cargo run -- \\");
-    println!("     --snapshot-addr 0x4012a5 \\");
-    println!("     --buffer-addr 0x7fffffffe000\n");
-}
-
-fn run_poc(
-    binary_path: &PathBuf,
-    snapshot_addr: u64,
-    buffer_addr: u64,
-    buffer_size: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("═══ Proof of Concept Execution ═══\n");
-
-    println!("📋 Current Implementation Status:\n");
-
-    println!("✅ IMPLEMENTED:");
-    println!("   • SymQemuModule structure");
-    println!("   • SnapshotModule integration");
-    println!("   • Shared memory setup for SymCC runtime");
-    println!("   • FFI bindings to _sym_make_symbolic");
-    println!("   • Module exports and visibility\n");
-
-    println!("⚠️  TODO (for full functionality):");
-    println!("   • Hook registration at snapshot_addr");
-    println!("   • Automatic snapshot capture on first execution");
-    println!("   • Snapshot restore mechanism");
-    println!("   • Buffer symbolic marking after restore");
-    println!("   • QEMU execution loop");
-    println!("   • Constraint collection from shared memory\n");
-
-    println!("📐 Architecture:");
-    println!("   ┌─────────────────┐");
-    println!("   │  Runner (this)  │");
-    println!("   └────────┬────────┘");
-    println!("            │");
-    println!("   ┌────────▼────────┐");
-    println!("   │  QemuBuilder    │");
-    println!("   │  + modules:     │");
-    println!("   │    - Snapshot   │");
-    println!("   │    - SymQemu    │");
-    println!("   └────────┬────────┘");
-    println!("            │");
-    println!("   ┌────────▼────────┐");
-    println!("   │   QEMU Process  │");
-    println!("   │   (usermode)    │");
-    println!("   └─────────────────┘\n");
-
-    println!("🎯 Next Steps:");
-    println!("   1. Implement instruction hook at 0x{:x}", snapshot_addr);
-    println!("   2. Hook callback: capture snapshot on first hit");
-    println!("   3. On subsequent executions: restore + mark buffer symbolic");
-    println!("   4. Run SymQEMU to generate constraints");
-    println!("   5. Parse and display constraints from shared memory\n");
-
-    println!("📚 For implementation details, see:");
-    println!("   • crates/libafl_qemu/src/modules/symqemu.rs");
-    println!("   • crates/libafl_qemu/src/modules/usermode/snapshot.rs");
-    println!("   • This file: snapshot_runner/src/main.rs\n");
-
-    println!("═══════════════════════════════════════════════════════════\n");
-
+    println!("\nSMOKE TEST PASSED: snapshot + symbolic execution + trace retrieval all work");
     Ok(())
 }

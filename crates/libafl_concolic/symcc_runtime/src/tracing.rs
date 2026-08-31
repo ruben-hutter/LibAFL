@@ -33,6 +33,35 @@ where
         }
     }
 
+    /// Finalize the current trace (update the length header in shared memory) and start
+    /// a fresh trace at the beginning of the shared memory region.
+    ///
+    /// For persistent (in-process) runtimes that produce one trace per execution into
+    /// the same shared memory buffer. The host should read the finished trace before
+    /// the next execution starts.
+    pub fn restart(&mut self) {
+        self.writer
+            .restart_trace()
+            .expect("failed to restart the tracing writer");
+    }
+
+    /// Finalize the current trace (update the length header in shared memory).
+    /// The host can then read the trace; call [`TracingRuntime::begin`] before
+    /// the next execution to start a fresh trace.
+    pub fn finish(&mut self) {
+        self.writer
+            .update_trace_header()
+            .expect("failed to update the tracing writer header");
+    }
+
+    /// Start a fresh trace at the beginning of the shared memory region.
+    /// Only valid after [`TracingRuntime::finish`].
+    pub fn begin(&mut self) {
+        self.writer
+            .begin_trace()
+            .expect("failed to begin a new tracing writer trace");
+    }
+
     #[expect(clippy::unnecessary_wraps)]
     fn write_message(&mut self, message: SymExpr) -> Option<RSymExpr> {
         Some(self.writer.write_message(message).unwrap())

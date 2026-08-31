@@ -224,6 +224,11 @@ impl<RT> OptionalRuntime<RT> {
     pub fn into_inner(self) -> Option<RT> {
         self.inner
     }
+
+    /// Mutable access to the inner runtime, if present.
+    pub fn inner_mut(&mut self) -> Option<&mut RT> {
+        self.inner.as_mut()
+    }
 }
 
 macro_rules! rust_runtime_function_declaration {

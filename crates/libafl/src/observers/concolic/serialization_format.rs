@@ -308,6 +308,29 @@ impl<W: Write + Seek> MessageFileWriter<W> {
         Ok(())
     }
 
+    /// Finalizes the current trace by updating the trace header, then rewinds to the
+    /// initial position and starts a fresh trace (resetting the expression id counter).
+    ///
+    /// This allows a persistent (in-process) runtime to emit multiple traces sequentially
+    /// into the same shared memory region. A reader should consume the finished trace
+    /// (via [`MessageFileReader::from_length_prefixed_buffer`]) between calls to this
+    /// method.
+    pub fn restart_trace(&mut self) -> io::Result<()> {
+        self.write_trace_size()?;
+        self.begin_trace()?;
+        Ok(())
+    }
+
+    /// Rewinds to the initial position and starts a fresh trace, resetting the
+    /// expression id counter. Only valid directly after [`MessageFileWriter::update_trace_header`].
+    pub fn begin_trace(&mut self) -> io::Result<()> {
+        self.writer.seek(SeekFrom::Start(self.writer_start_position))?;
+        self.id_counter = 1;
+        // write preliminary trace length of the new trace
+        self.writer.write_all(&0_u64.to_le_bytes())?;
+        Ok(())
+    }
+
     fn make_relative(&self, expr: SymExprRef) -> SymExprRef {
         SymExprRef::new(self.id_counter - expr.get()).unwrap()
     }

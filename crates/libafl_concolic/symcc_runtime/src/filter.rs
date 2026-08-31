@@ -95,6 +95,11 @@ impl<F, RT> FilterRuntime<F, RT> {
     pub fn new(filter: F, runtime: RT) -> Self {
         Self { filter, runtime }
     }
+
+    /// Mutable access to the inner runtime.
+    pub fn runtime_mut(&mut self) -> &mut RT {
+        &mut self.runtime
+    }
 }
 
 macro_rules! rust_filter_function_implementation {
