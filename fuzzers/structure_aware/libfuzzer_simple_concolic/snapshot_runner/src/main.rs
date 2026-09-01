@@ -176,12 +176,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let len = input.len().min(size as usize).min(4096);
         qemu.write_mem(buffer, &input[..len]).expect("write input to guest buffer");
 
-        // === 3c. mark the buffer symbolic (g2h translation inside the module) ===
+        // === 3c. mark the input-length prefix symbolic (g2h inside module) ===
         emulator
             .modules_mut()
             .get_mut::<SymQemuModule>()
             .unwrap()
-            .mark_buffer_symbolic(qemu);
+            .mark_buffer_symbolic(qemu, len);
 
         // === 3d. resume execution until the return address ===
         let start = std::time::Instant::now();

@@ -218,13 +218,32 @@ fn main() {
 
     // === 3. Build the LibAFL SymCC runtime (Rust implementation) ===
     println!("Building LibAFL Rust runtime...");
-    std::process::Command::new("cargo")
+    let mut runtime_build = std::process::Command::new("cargo");
+    runtime_build
         .current_dir(&runtime_dir)
         .env_remove("CARGO_TARGET_DIR")
         .arg("build")
-        .arg("--release")
-        .status()
-        .expect("Failed to build runtime");
+        .arg("--release");
+    if std::env::var_os("CARGO_FEATURE_QEMU_SNAPSHOT").is_some() {
+        // The hybrid QEMU already links the C++ _sym_* shim. Exporting the
+        // same wrappers from libSymRuntime.so would create a second provider
+        // and split trace control from the runtime receiving _rsym_* calls.
+        runtime_build.arg("--no-default-features");
+    }
+    let status = runtime_build.status().expect("Failed to build runtime");
+    if !status.success() {
+        panic!("Building libSymRuntime.so failed");
+    }
+    // Rerun this build script (and thus rebuild the runtime) when its sources
+    // change - otherwise libSymRuntime.so silently goes stale.
+    println!(
+        "cargo:rerun-if-changed={}",
+        runtime_dir.join("src").join("lib.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        runtime_dir.join("Cargo.toml").display()
+    );
 
     // Copy libSymRuntime.so to runtime directory for easier access
     std::fs::copy(
@@ -241,6 +260,11 @@ fn main() {
         exit(1);
     }
 
+    // The standalone SymQEMU/SymCC machinery below is only needed for the
+    // spawn-per-execution modes (separate/symcc/forkserver). The in-process
+    // qemu-snapshot mode uses the hybrid QEMU tree instead (linked at the
+    // end of this script) and skips these steps entirely.
+    if std::env::var_os("CARGO_FEATURE_QEMU_SNAPSHOT").is_none() {
     // === 4. Clone AFL++ SymCC fork (has rust_backend) ===
     let symcc_src_dir = out_path.join("aflpp_symcc_src");
     if !symcc_src_dir.exists() {
@@ -302,6 +326,49 @@ fn main() {
 
     if !output.status.success() {
         println!("cargo:warning=Building harness_symcc.c with SymCC failed (non-fatal)");
+    }
+    } // end of standalone-mode build steps
+
+    // === 5. In-process snapshot mode: link the SymCC runtime + C++ shim ===
+    // The hybrid libqemu-x86_64.so (via libafl_qemu) references _rsym_*/_sym_*
+    // that must resolve inside this process. Link the single shared runtime
+    // instance and the C++ shim directly, with absolute rpaths baked in.
+    if std::env::var_os("CARGO_FEATURE_QEMU_SNAPSHOT").is_some() {
+        let base = std::env::current_dir().unwrap();
+        let runtime_dir = base
+            .join("..")
+            .join("runtime")
+            .join("target")
+            .join("release")
+            .canonicalize()
+            .expect("runtime not built: run `cargo build --release` in ../runtime first");
+        let shim_dir = base
+            .join("..")
+            .join("qemu-hybrid")
+            .join("build")
+            .join("subprojects")
+            .join("symcc-rt")
+            .canonicalize()
+            .expect("qemu-hybrid not built (expected at ../qemu-hybrid)");
+        let qemu_dir = base
+            .join("..")
+            .join("qemu-hybrid")
+            .join("build")
+            .canonicalize()
+            .expect("qemu-hybrid not built (expected at ../qemu-hybrid)");
+
+        println!("cargo:rustc-link-search=native={}", runtime_dir.display());
+        println!("cargo:rustc-link-lib=dylib=SymRuntime");
+        println!("cargo:rustc-link-search=native={}", shim_dir.display());
+        println!("cargo:rustc-link-lib=dylib=SymCCRtShared");
+        for dir in [&runtime_dir, &shim_dir, &qemu_dir] {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+        }
+        // Build libafl_qemu against the hybrid tree (must not fall back to
+        // cloning the upstream bridge).
+        if std::env::var_os("LIBAFL_QEMU_DIR").is_none() {
+            panic!("qemu-snapshot feature requires LIBAFL_QEMU_DIR pointing at the hybrid QEMU tree (see snapshot_runner/env.sh)");
+        }
     }
 
     println!("Build completed successfully!");

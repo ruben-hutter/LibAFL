@@ -12,6 +12,10 @@ build = "build.rs"
 [features]
 default = ["std"]
 std = []
+# In-process snapshot-based concolic execution over the hybrid QEMU tree
+# (qemu-hybrid/). Build with this feature AND the environment from
+# snapshot_runner/env.sh (LIBAFL_QEMU_DIR, LLVM_CONFIG_PATH, CC/CXX=clang).
+qemu-snapshot = ["dep:libafl_qemu"]
 
 [profile.release]
 lto = true
@@ -24,6 +28,10 @@ libafl = { path = "../../../../crates/libafl", features = [
   "concolic_mutation",
 ] }
 libafl_bolts = { path = "../../../../crates/libafl_bolts" }
+libafl_qemu = { path = "../../../../crates/libafl_qemu", features = [
+  "usermode",
+  "shared",
+], optional = true }
 libafl_targets = { path = "../../../../crates/libafl_targets", features = [
   "sancov_pcguard_edges",
   "sancov_cmplog",

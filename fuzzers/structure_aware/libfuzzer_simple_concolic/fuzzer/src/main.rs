@@ -248,22 +248,30 @@ fn fuzz(
 
             fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut restarting_mgr)?;
         } else if opt.use_snapshot {
-            println!("Using SymQEMU snapshot-based concolic execution (in-process)");
+            #[cfg(feature = "qemu-snapshot")]
+            {
+                println!("Using SymQEMU snapshot-based concolic execution (in-process)");
 
-            let configurator = MyCommandConfiguratorSymQemuSnapshot::new();
-            let mut stages = tuple_list!(
-                ConcolicTracingStage::new(
-                    TracingStage::new(configurator.into_executor(
-                        tuple_list!(concolic_observer),
-                        None,
-                        None
-                    ),),
-                    concolic_ref,
-                ),
-                SimpleConcolicMutationalStage::new(),
-            );
+                let snapshot_executor =
+                    SnapshotConcolicExecutor::new(tuple_list!(concolic_observer));
+                let mut stages = tuple_list!(
+                    ConcolicTracingStage::new(
+                        TracingStage::new(snapshot_executor),
+                        concolic_ref,
+                    ),
+                    SimpleConcolicMutationalStage::new(),
+                );
 
-            fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut restarting_mgr)?;
+                fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut restarting_mgr)?;
+            }
+            #[cfg(not(feature = "qemu-snapshot"))]
+            {
+                println!("ERROR: --use-snapshot requires building with the qemu-snapshot feature:");
+                println!("  source ../snapshot_runner/env.sh && cargo build --release --features qemu-snapshot");
+                return Err(Error::unsupported_option(
+                    "--use-snapshot requires the qemu-snapshot build feature",
+                ));
+            }
         } else if use_symcc {
             println!("Using SymCC for concolic execution");
             // The order of the stages matter!
@@ -312,50 +320,273 @@ fn fuzz(
     Ok(())
 }
 
-#[derive(Default, Debug)]
-pub struct MyCommandConfiguratorSymQemuSnapshot {
-    target_function: String,
-}
+/// In-process snapshot-based concolic executor over the hybrid QEMU
+/// (LibAFL bridge + SymQEMU symbolic TCG, see `qemu-hybrid/`).
+///
+/// On the first [`Executor::run_target`] call it starts the emulator on
+/// `target_snapshot.out`, runs the guest normally until the
+/// `LLVMFuzzerTestOneInput` breakpoint and captures a full snapshot
+/// (CPU + RAM) there. Every subsequent call restores the snapshot, writes
+/// the input into the guest input buffer, marks it symbolic via the SymCC
+/// runtime and resumes execution until the harness returns. The concolic
+/// trace lands in the shared memory observed by [`ConcolicObserver`].
+#[cfg(feature = "qemu-snapshot")]
+mod snapshot_concolic {
+    use std::fs;
 
-impl MyCommandConfiguratorSymQemuSnapshot {
-    pub fn new() -> Self {
-        Self {
-            target_function: env::var("SNAPSHOT_TARGET_FUNCTION")
-                .unwrap_or_else(|_| "LLVMFuzzerTestOneInput".to_string()),
+    use libafl::{
+        executors::{Executor, ExitKind, HasObservers},
+        inputs::{BytesInput, HasTargetBytes},
+        observers::ObserversTuple,
+        Error,
+    };
+    use libafl_bolts::{
+        tuples::{tuple_list, MatchName, RefIndexable},
+        AsSlice,
+    };
+    use libafl_qemu::{
+        command::NopCommandManager,
+        elf::EasyElf,
+        modules::{usermode::SnapshotModule, SymQemuModule},
+        Emulator, NopEmulatorDriver, NopSnapshotManager, Qemu, QemuExitError,
+        QemuExitReason, Regs,
+    };
+
+    // Control hooks provided by libSymRuntime.so (linked via build.rs):
+    // finalize the trace after each execution / begin a fresh one.
+    unsafe extern "C" {
+        fn _libafl_concolic_end_trace();
+        fn _libafl_concolic_begin_trace();
+    }
+
+    /// Size of the dummy input file used to boot the guest; the harness
+    /// mallocs its input buffer from the file size, so this is also the
+    /// maximum input length applied per execution.
+    const GUEST_INPUT_FILE_SIZE: usize = 4096;
+
+    struct Inner {
+        emulator:
+            Emulator<
+                (),
+                NopCommandManager,
+                NopEmulatorDriver,
+                (SnapshotModule, (SymQemuModule, ())),
+                BytesInput,
+                (),
+                NopSnapshotManager,
+            >,
+        qemu: Qemu,
+        buffer: u64,
+        buffer_size: usize,
+        #[allow(dead_code)]
+        ret_addr: u64,
+        traced_before: bool,
+    }
+
+    pub struct SnapshotConcolicExecutor<OT> {
+        observers: OT,
+        inner: Option<Inner>,
+    }
+
+    impl<OT> SnapshotConcolicExecutor<OT> {
+        pub fn new(observers: OT) -> Self {
+            Self {
+                observers,
+                inner: None,
+            }
+        }
+
+        fn init_inner(&mut self) -> Result<(), Error> {
+            // The guest main() reads argv[1] into a malloc'd buffer. Content
+            // is irrelevant (overwritten per execution), only the size
+            // determines the buffer allocation.
+            eprintln!("[snapshot-executor] init: writing guest input file");
+            fs::write("cur_input", vec![0u8; GUEST_INPUT_FILE_SIZE])?;
+
+            let qemu_args = vec![
+                "qemu-x86_64".to_string(),
+                "./target_snapshot.out".to_string(),
+                "cur_input".to_string(),
+            ];
+
+            eprintln!("[snapshot-executor] init: building emulator (QEMU init)");
+            let builder = Emulator::<(), _, _, (), BytesInput, (), _>::empty()
+                .qemu_parameters(qemu_args)
+                .modules(tuple_list!(
+                    SnapshotModule::new(),
+                    SymQemuModule::new(0, GUEST_INPUT_FILE_SIZE)
+                ));
+            let mut emulator = builder.build()?;
+
+            eprintln!("[snapshot-executor] init: emulator built, resolving entry");
+            let qemu = emulator.qemu();
+
+            let mut elf_buffer = Vec::new();
+            let elf = EasyElf::from_file(qemu.binary_path(), &mut elf_buffer)?;
+            let entry = elf
+                .resolve_symbol("LLVMFuzzerTestOneInput", qemu.load_addr())
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "LLVMFuzzerTestOneInput not found in {}",
+                        qemu.binary_path()
+                    ))
+                })?;
+
+            eprintln!("[snapshot-executor] init: running guest to entry breakpoint");
+            // === run normally until the entry point ===
+            qemu.set_breakpoint(entry);
+            let exit = unsafe { qemu.run() };
+            match exit {
+                Ok(QemuExitReason::Breakpoint(_)) => {}
+                other => {
+                    return Err(Error::invalid_input(format!(
+                        "unexpected QEMU exit while running to entry: {other:?}"
+                    )))
+                }
+            }
+
+            eprintln!("[snapshot-executor] init: reached entry, reading regs");
+            let buffer: u64 = qemu
+                .read_reg(Regs::Rdi)
+                .map_err(|e| Error::invalid_input(format!("failed to read RDI: {e:?}")))?
+                .into();
+            let size: u64 = qemu
+                .read_reg(Regs::Rsi)
+                .map_err(|e| Error::invalid_input(format!("failed to read RSI: {e:?}")))?
+                .into();
+            let sp: u64 = qemu
+                .read_reg(Regs::Sp)
+                .map_err(|e| Error::invalid_input(format!("failed to read SP: {e:?}")))?
+                .into();
+            let mut ret_addr_buf = [0u8; 8];
+            qemu.read_mem(sp, &mut ret_addr_buf)
+                .map_err(|e| Error::invalid_input(format!("failed to read return address: {e:?}")))?;
+            let ret_addr = u64::from_le_bytes(ret_addr_buf);
+
+            let buffer_size = (size as usize).min(GUEST_INPUT_FILE_SIZE);
+
+            eprintln!("[snapshot-executor] init: capturing snapshot");
+            // === capture the snapshot at the entry point ===
+            {
+                let modules = emulator.modules_mut();
+                let snapshot = modules
+                    .get_mut::<SnapshotModule>()
+                    .expect("SnapshotModule in tuple");
+                snapshot.use_manual_reset();
+                snapshot.snapshot(qemu);
+                modules
+                    .get_mut::<SymQemuModule>()
+                    .expect("SymQemuModule in tuple")
+                    .set_buffer_addr(buffer);
+                modules
+                    .get_mut::<SymQemuModule>()
+                    .expect("SymQemuModule in tuple")
+                    .set_buffer_size(buffer_size);
+            }
+
+            // From now on, stop at the return address of LLVMFuzzerTestOneInput.
+            qemu.remove_breakpoint(entry);
+            qemu.set_breakpoint(ret_addr);
+
+            println!(
+                "[snapshot-executor] entry {entry:#x}, buffer {buffer:#x} (size {buffer_size}), ret {ret_addr:#x}"
+            );
+
+            self.inner = Some(Inner {
+                emulator,
+                qemu,
+                buffer,
+                buffer_size,
+                ret_addr,
+                traced_before: false,
+            });
+            Ok(())
+        }
+    }
+
+    impl<EM, OT, S, Z> Executor<EM, BytesInput, S, Z> for SnapshotConcolicExecutor<OT>
+    where
+        OT: MatchName + ObserversTuple<BytesInput, S>,
+    {
+        fn run_target(
+            &mut self,
+            _fuzzer: &mut Z,
+            _state: &mut S,
+            _mgr: &mut EM,
+            input: &BytesInput,
+        ) -> Result<ExitKind, Error> {
+            if self.inner.is_none() {
+                self.init_inner()?;
+            }
+            let inner = self.inner.as_mut().expect("inner initialized");
+
+            if inner.traced_before {
+                // Finish of the previous trace already happened at the end of
+                // the last run; start the fresh trace for this execution.
+                // SAFETY: the runtime lives in this process (libSymRuntime.so).
+                unsafe { _libafl_concolic_begin_trace() };
+            }
+            inner.traced_before = true;
+
+            // === restore the snapshot ===
+            inner
+                .emulator
+                .modules_mut()
+                .get_mut::<SnapshotModule>()
+                .expect("SnapshotModule in tuple")
+                .reset(inner.qemu);
+
+            // === write the input into the guest buffer ===
+            let bytes = input.target_bytes();
+            let buf = AsSlice::as_slice(&bytes);
+            let len = buf.len().min(inner.buffer_size);
+            inner
+                .qemu
+                .write_mem(inner.buffer, &buf[..len])
+                .map_err(|e| Error::invalid_input(format!("failed to write guest input: {e:?}")))?;
+
+            // === mark the (input-length prefix of the) buffer symbolic ===
+            inner
+                .emulator
+                .modules_mut()
+                .get_mut::<SymQemuModule>()
+                .expect("SymQemuModule in tuple")
+                .mark_buffer_symbolic(inner.qemu, len);
+
+            // === resume execution until the harness returns ===
+            let exit = unsafe { inner.qemu.run() };
+
+            // === finalize the trace so the ConcolicObserver can read it ===
+            // SAFETY: see above.
+            unsafe { _libafl_concolic_end_trace() };
+
+            match exit {
+                Ok(QemuExitReason::Breakpoint(_)) => Ok(ExitKind::Ok),
+                Ok(QemuExitReason::Crash) => Ok(ExitKind::Crash),
+                Ok(QemuExitReason::Timeout) => Ok(ExitKind::Timeout),
+                Err(QemuExitError::UnexpectedExit) => Ok(ExitKind::Crash),
+                other => Err(Error::invalid_input(format!(
+                    "unexpected QEMU exit: {other:?}"
+                ))),
+            }
+        }
+    }
+
+    impl<OT> HasObservers for SnapshotConcolicExecutor<OT> {
+        type Observers = OT;
+
+        fn observers(&self) -> RefIndexable<&Self::Observers, Self::Observers> {
+            RefIndexable::from(&self.observers)
+        }
+
+        fn observers_mut(&mut self) -> RefIndexable<&mut Self::Observers, Self::Observers> {
+            RefIndexable::from(&mut self.observers)
         }
     }
 }
 
-impl CommandConfigurator<Child> for MyCommandConfiguratorSymQemuSnapshot {
-    fn spawn_child(&mut self, target_bytes: OwnedSlice<'_, u8>) -> Result<Child, Error> {
-        fs::write("cur_input", target_bytes.as_slice())?;
-
-        let shmem_env = env::var(DEFAULT_ENV_NAME)
-            .expect("Concolic shared memory env var not set in parent process");
-
-        Ok(Command::new("./qemu-x86_64")
-            .arg("./target_snapshot.out")
-            .arg("cur_input")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env("SYMCC_INPUT_FILE", "cur_input")
-            .env(DEFAULT_ENV_NAME, &shmem_env)
-            .env("SYMCC_ENABLE_SNAPSHOT", "1")
-            .env("SYMCC_SNAPSHOT_TARGET_FUNCTION", &self.target_function)
-            .spawn()
-            .expect("failed to start SymQEMU snapshot process"))
-    }
-
-    fn exec_timeout(&self) -> Duration {
-        Duration::from_secs(5)
-    }
-
-    fn exec_timeout_mut(&mut self) -> &mut Duration {
-        static mut TIMEOUT: Duration = Duration::from_secs(5);
-        unsafe { &mut TIMEOUT }
-    }
-}
+#[cfg(feature = "qemu-snapshot")]
+use snapshot_concolic::SnapshotConcolicExecutor;
 
 #[derive(Default, Debug)]
 pub struct MyCommandConfiguratorSymQEMU;

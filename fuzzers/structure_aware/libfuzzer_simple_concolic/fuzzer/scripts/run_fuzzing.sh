@@ -30,6 +30,10 @@ echo -e "${BLUE}Concolic clients: ${NUM_CONCOLIC} (mode: ${CONCOLIC_MODE})${NC}"
 echo ""
 
 # Build (no usermode feature needed for fork-server mode)
+# SKIP_BUILD=1 to use the already-built binary (e.g. the qemu-snapshot
+# feature build done by `just run-snapshot`; a plain rebuild here would
+# overwrite it with a non-feature binary).
+if [ -z "$SKIP_BUILD" ]; then
 echo -e "${YELLOW}Building fuzzer in ${BUILD_MODE} mode...${NC}"
 if [ "$BUILD_MODE" = "release" ]; then
     cargo build --release
@@ -39,6 +43,7 @@ fi
 if [ $? -ne 0 ]; then
     echo -e "${RED}Build failed!${NC}"
     exit 1
+fi
 fi
 
 # Get current working directory
@@ -168,7 +173,14 @@ echo ""
 echo -e "${GREEN}=== Fuzzing setup complete! ===${NC}"
 echo -e "${BLUE}Session: $SESSION_NAME${NC}"
 echo ""
-echo "Commands:"
+echo "Just recipes (justfile one level up, run them from there):"
+if command -v just >/dev/null 2>&1 && [ -f "$WORK_DIR/../justfile" ]; then
+    just --justfile "$WORK_DIR/../justfile" --list
+else
+    echo -e "  ${YELLOW}(just or justfile not found)${NC}"
+fi
+echo ""
+echo "tmux commands:"
 echo -e "  ${YELLOW}tmux attach -t $SESSION_NAME${NC}       - Attach to session"
 echo -e "  ${YELLOW}tmux kill-session -t $SESSION_NAME${NC} - Kill entire session (clean restart)"
 echo -e "  ${YELLOW}Ctrl+B then D${NC}                      - Detach from session"

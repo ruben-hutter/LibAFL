@@ -9,13 +9,18 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use symcc_runtime::{
-    filter::{CallStackCoverage, FilterRuntime, NoFloat},
+    filter::{FilterRuntime, NoFloat},
     tracing, OptionalRuntime, Runtime, RSymExpr, StdShMem,
 };
 
+// NOTE: no CallStackCoverage filter - it keeps a persistent hitcount bitmap
+// across executions and suppresses expressions from re-visited (site,
+// callstack) pairs. For snapshot-based concolic execution every input needs
+// its FULL trace on every (re-)execution, so gating by "already seen" is
+// wrong here.
 type InnerRuntime = FilterRuntime<
     NoFloat,
-    FilterRuntime<CallStackCoverage, OptionalRuntime<tracing::TracingRuntime<StdShMem>>>,
+    OptionalRuntime<tracing::TracingRuntime<StdShMem>>,
 >;
 
 static mut GLOBAL_DATA: Option<InnerRuntime> = None;
@@ -29,10 +34,7 @@ fn with_state<R>(cb: impl FnOnce(&mut InnerRuntime) -> R) -> R {
                 .map(|writer| tracing::TracingRuntime::new(writer, false)),
         );
         unsafe {
-            GLOBAL_DATA = Some(FilterRuntime::new(
-                NoFloat,
-                FilterRuntime::new(CallStackCoverage::default(), inner),
-            ));
+            GLOBAL_DATA = Some(FilterRuntime::new(NoFloat, inner));
         }
         INITIALIZED.store(true, Ordering::Release);
     }
@@ -46,7 +48,7 @@ fn with_state<R>(cb: impl FnOnce(&mut InnerRuntime) -> R) -> R {
 #[no_mangle]
 pub unsafe extern "C" fn _libafl_concolic_end_trace() {
     with_state(|rt| {
-        if let Some(tracing_rt) = rt.runtime_mut().runtime_mut().inner_mut() {
+        if let Some(tracing_rt) = rt.runtime_mut().inner_mut() {
             tracing_rt.finish();
         }
     });
@@ -58,7 +60,7 @@ pub unsafe extern "C" fn _libafl_concolic_end_trace() {
 #[no_mangle]
 pub unsafe extern "C" fn _libafl_concolic_begin_trace() {
     with_state(|rt| {
-        if let Some(tracing_rt) = rt.runtime_mut().runtime_mut().inner_mut() {
+        if let Some(tracing_rt) = rt.runtime_mut().inner_mut() {
             tracing_rt.begin();
         }
     });
@@ -74,11 +76,7 @@ pub unsafe extern "C" fn _libafl_concolic_begin_trace() {
 #[no_mangle]
 pub unsafe extern "C" fn _libafl_concolic_restart_trace() {
     with_state(|rt| {
-        if let Some(tracing_rt) = rt
-            .runtime_mut()
-            .runtime_mut()
-            .inner_mut()
-        {
+        if let Some(tracing_rt) = rt.runtime_mut().inner_mut() {
             tracing_rt.restart();
         }
     });

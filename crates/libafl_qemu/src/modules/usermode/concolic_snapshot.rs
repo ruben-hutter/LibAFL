@@ -226,7 +226,7 @@ where
 
             log::debug!("Wrote {} bytes to buffer at 0x{:x}", len, buffer_addr);
 
-            self.symqemu_module.mark_buffer_symbolic(qemu);
+            self.symqemu_module.mark_buffer_symbolic(qemu, len);
             log::debug!("Marked buffer as symbolic for SymQEMU");
         } else {
             log::warn!("Buffer address not discovered — cannot write input or mark symbolic");

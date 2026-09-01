@@ -54,7 +54,7 @@ impl SymQemuModule {
         }
     }
 
-    /// Mark the input buffer as symbolic using the SymCC runtime
+    /// Mark (a prefix of) the input buffer as symbolic using the SymCC runtime
     ///
     /// This should be called after restoring a snapshot (and after writing the
     /// concrete input bytes into the guest buffer). The guest address is
@@ -62,18 +62,24 @@ impl SymQemuModule {
     /// maps guest RAM at host addresses, so the SymCC runtime's shadow memory
     /// keyed by host pointer will match the addresses seen by TCG-generated
     /// symbolic loads.
-    pub fn mark_buffer_symbolic(&self, qemu: Qemu) {
+    ///
+    /// `byte_length` bytes are marked, starting at the buffer address. Mark
+    /// only the concrete input length here: expression indices in the trace
+    /// match `input_offset + i`, and every marked byte also becomes part of
+    /// the constraint formulas handed to the solver.
+    pub fn mark_buffer_symbolic(&self, qemu: Qemu, byte_length: usize) {
+        let byte_length = byte_length.min(self.input_buffer_size);
         log::info!(
             "Marking buffer at 0x{:x} (size: {}) as symbolic",
             self.input_buffer_addr,
-            self.input_buffer_size
+            byte_length
         );
 
         let host_ptr = qemu.g2h::<u8>(self.input_buffer_addr) as *const core::ffi::c_void;
         unsafe {
             // input_offset = 0: expression indices in the concolic trace match
             // the offsets within this buffer (and thus the fuzzer input).
-            _sym_make_symbolic(host_ptr, self.input_buffer_size, 0);
+            _sym_make_symbolic(host_ptr, byte_length, 0);
         }
     }
 
@@ -108,6 +114,17 @@ impl SymQemuModule {
             addr
         );
         self.input_buffer_addr = addr;
+    }
+
+    /// Set the buffer size (e.g. to the actually allocated size discovered at
+    /// the snapshot point).
+    pub fn set_buffer_size(&mut self, size: usize) {
+        log::debug!(
+            "Updating buffer size from {} to {}",
+            self.input_buffer_size,
+            size
+        );
+        self.input_buffer_size = size;
     }
 }
 
