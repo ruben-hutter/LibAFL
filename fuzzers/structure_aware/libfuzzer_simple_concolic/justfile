@@ -96,12 +96,17 @@ run num_regular="2" num_concolic="1" mode="forkserver": build-release
 run-dev num_regular="2" num_concolic="1" mode="forkserver": build-dev
     @cd fuzzer && FUZZER_MODE=debug bash scripts/run_fuzzing.sh {{num_regular}} {{num_concolic}} {{mode}}
 
-# Shortcut: snapshot concolic mode only (args: num_regular num_concolic)
+# Shortcut: snapshot concolic mode only (args: num_regular num_concolic [target_function])
 # In-process SymQEMU snapshot execution over the hybrid QEMU tree.
 # Kills any previous fuzzing session/processes first, rebuilds with the
 # qemu-snapshot feature, then creates the tmux session like `run`.
 # Requires qemu-hybrid/ to be built (see snapshot_runner/env.sh + MILESTONE_PLAN.md).
-run-snapshot num_regular="0" num_concolic="1":
+#
+# target_function: optional guest function where the snapshot is taken and
+#   symbolic execution starts (set via the SNAPSHOT_TARGET_FUNCTION env var,
+#   resolved as an ELF symbol; defaults to LLVMFuzzerTestOneInput).
+#   Example: just run-snapshot 0 1 foo
+run-snapshot num_regular="0" num_concolic="1" target_function="":
     #!/usr/bin/env bash
     set -e
     tmux kill-session -t libafl_fuzz 2>/dev/null || true
@@ -110,6 +115,10 @@ run-snapshot num_regular="0" num_concolic="1":
     source snapshot_runner/env.sh
     cd fuzzer
     cargo build --release --features qemu-snapshot
+    if [ -n "{{target_function}}" ]; then
+        export SNAPSHOT_TARGET_FUNCTION="{{target_function}}"
+        echo "Snapshot entry point: {{target_function}}"
+    fi
     FUZZER_MODE=release SKIP_BUILD=1 bash scripts/run_fuzzing.sh {{num_regular}} {{num_concolic}} snapshot
 
 # Kill the fuzzing tmux session and all fuzzer processes (clean restart helper)
