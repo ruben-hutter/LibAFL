@@ -82,17 +82,39 @@ executor.
   execution (this was also the root cause of the old empty-trace bug);
   --dynamic-list/-E exports don't survive rust-lld + gc-sections for PIE.
 
-### Phase 3c — Fuzzer integration [IN PROGRESS]
-- Replace the spawn-child --use-snapshot configurator with the in-process
-  emulator flow (as in snapshot_runner/src/main.rs) inside ConcolicTracingStage.
-- Fuzzer needs: libafl_qemu dep (usermode+shared), link SymRuntime +
-  SymCCRtShared via build.rs rpaths (copy snapshot_runner/build.rs approach),
-  build with snapshot_runner/env.sh environment.
+### Phase 3c — Fuzzer integration [DONE, 97874ca0]
+- `SnapshotConcolicExecutor` in `fuzzer/src/main.rs` behind the
+  `qemu-snapshot` cargo feature: lazy emulator boot, run-to-entry, snapshot,
+  per-input restore/write/mark-symbolic/resume, per-execution trace
+  finalize (`_libafl_concolic_end/begin_trace`).
+- build.rs links SymRuntime + SymCCRtShared (absolute rpaths) only for the
+  feature build and skips the standalone SymQEMU/SymCC steps; runtime
+  sources are watched via rerun-if-changed (they silently went stale once).
 
-### Phase 4 — End-to-end validation (just run-snapshot)
-- Assert non-empty traces, Z3 solutions for foo()'s nested conditions,
-  compare exec/speed vs forkserver/separate modes.
+### Phase 4 — End-to-end validation [DONE]
+- `just run-snapshot` runs broker + concolic client(s) in tmux
+  (`just kill-fuzz` to stop). Full loop verified live: run-to-entry,
+  snapshot, per-input restore (~µs), symbolic execution, trace decode,
+  Z3 solving (generated the `QEMU…42 13 37` mutation for foo()'s nested
+  conditions from the all-'a' seed) and mutation evaluation into the corpus.
 
-### Fallback
-If Phase 2 merge fails badly, the committed fork-server mode is a
-demonstrable milestone on its own. (No longer needed.)
+### Bugs found & fixed along the way (summary)
+1. Missing `pub mod symqemu` declaration (never compiled before).
+2. `_sym_make_symbolic` FFI signature + guest-vs-host pointer + duplicate
+   shmem init in SymQemuModule.
+3. Trace length header only written on runtime Drop -> persistent runtimes
+   need explicit end/begin per execution (root cause of the historical
+   empty-trace issue).
+4. Double runtime instance via the shim linking libSymRuntime.so; fixed by
+   keeping `_rsym_*` unresolved in the shim (host provides them) and
+   `--unresolved-symbols=ignore-all` + `-z now` (lazy PLT resolution in a
+   forked child of a multithreaded parent spins forever on ld.so locks).
+5. Stale `fuzzer/libSymRuntime.so` shadowing the fresh one via
+   LD_LIBRARY_PATH precedence; removed and gitignored.
+6. **CallStackCoverage filter suppressing re-traces** (persistent hitcount
+   bitmap -> empty traces after first pass); dropped from the runtime stack.
+7. Mark only the input-length prefix symbolic (whole-buffer marking blew up
+   Z3 formulas).
+8. `llvm-config` too old for rustc 1.94: set LLVM_CONFIG_PATH=/usr/lib/llvm-20.
+9. AFLplusplus/symcc repo vanished: seed `libafl_symcc_src` caches from
+   runtime/target/release/build/symcc_runtime-*/out when builds fail.
