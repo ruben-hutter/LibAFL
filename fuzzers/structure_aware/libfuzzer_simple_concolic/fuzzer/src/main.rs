@@ -423,11 +423,15 @@ mod snapshot_concolic {
 
             let mut elf_buffer = Vec::new();
             let elf = EasyElf::from_file(qemu.binary_path(), &mut elf_buffer)?;
+            // Snapshot entry point: symbol name, resolved against the guest
+            // load base at runtime (override via SNAPSHOT_TARGET_FUNCTION).
+            let target_function = std::env::var("SNAPSHOT_TARGET_FUNCTION")
+                .unwrap_or_else(|_| "LLVMFuzzerTestOneInput".to_string());
             let entry = elf
-                .resolve_symbol("LLVMFuzzerTestOneInput", qemu.load_addr())
+                .resolve_symbol(&target_function, qemu.load_addr())
                 .ok_or_else(|| {
                     Error::invalid_input(format!(
-                        "LLVMFuzzerTestOneInput not found in {}",
+                        "{target_function} not found in {}",
                         qemu.binary_path()
                     ))
                 })?;

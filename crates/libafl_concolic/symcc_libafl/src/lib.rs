@@ -1,8 +1,10 @@
 //! This is a 'meta-package' for libafl that exposes a consistent URL and commit hash for the
-//! [`SymCC` fork](https://github.com/AFLplusplus/symcc).
+//! [`SymCC` fork](https://github.com/eurecom-s3/symcc).
 
-/// The URL of the `LibAFL` `SymCC` fork.
-pub const SYMCC_REPO_URL: &str = "https://github.com/AFLplusplus/symcc.git";
+/// The URL of the `LibAFL` `SymCC` repository.
+/// (The AFLplusplus/symcc fork was deleted from GitHub; the rust_backend and
+/// the pinned commit were contributed upstream to eurecom-s3/symcc.)
+pub const SYMCC_REPO_URL: &str = "https://github.com/eurecom-s3/symcc.git";
 /// The commit of the `LibAFL` `SymCC` fork.
 pub const SYMCC_REPO_COMMIT: &str = "1330e29d28bce706d9f7c0864da3b0a5ae218e03";
 
