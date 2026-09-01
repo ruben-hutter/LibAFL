@@ -251,6 +251,11 @@ fn fuzz(
             #[cfg(feature = "qemu-snapshot")]
             {
                 println!("Using SymQEMU snapshot-based concolic execution (in-process)");
+                println!("[snapshot-mode] NOTE: tracing iterations run the guest under the hybrid");
+                println!("[snapshot-mode] QEMU and do NOT increase the broker's 'executions' counter;");
+                println!("[snapshot-mode] edges only grow when Z3-generated mutations are evaluated");
+                println!("[snapshot-mode] natively. 'edges: X/Y' means Y = distinct native edges");
+                println!("[snapshot-mode] discovered so far (dynamic, not a fixed total).");
 
                 let snapshot_executor =
                     SnapshotConcolicExecutor::new(tuple_list!(concolic_observer));
@@ -386,6 +391,7 @@ mod snapshot_concolic {
     pub struct SnapshotConcolicExecutor<OT> {
         observers: OT,
         inner: Option<Inner>,
+        traced_count: usize,
     }
 
     impl<OT> SnapshotConcolicExecutor<OT> {
@@ -393,6 +399,7 @@ mod snapshot_concolic {
             Self {
                 observers,
                 inner: None,
+                traced_count: 0,
             }
         }
 
@@ -403,9 +410,13 @@ mod snapshot_concolic {
             eprintln!("[snapshot-executor] init: writing guest input file");
             fs::write("cur_input", vec![0u8; GUEST_INPUT_FILE_SIZE])?;
 
+            // Guest binary for the snapshot flow (built by build.rs from
+            // harness_snapshot.c; override with SNAPSHOT_TARGET_BIN).
+            let guest_bin = std::env::var("SNAPSHOT_TARGET_BIN")
+                .unwrap_or_else(|_| "./target_snapshot.out".to_string());
             let qemu_args = vec![
                 "qemu-x86_64".to_string(),
-                "./target_snapshot.out".to_string(),
+                guest_bin,
                 "cur_input".to_string(),
             ];
 
@@ -563,6 +574,17 @@ mod snapshot_concolic {
             // === finalize the trace so the ConcolicObserver can read it ===
             // SAFETY: see above.
             unsafe { _libafl_concolic_end_trace() };
+
+            self.traced_count += 1;
+            if self.traced_count % 25 == 0 {
+                // Tracing iterations are invisible in the broker stats
+                // (executions/edges come from native mutation evaluation);
+                // this line is the live "it is working" signal.
+                println!(
+                    "[snapshot-executor] traced {} inputs so far",
+                    self.traced_count
+                );
+            }
 
             match exit {
                 Ok(QemuExitReason::Breakpoint(_)) => Ok(ExitKind::Ok),
