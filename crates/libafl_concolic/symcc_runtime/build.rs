@@ -114,7 +114,32 @@ fn checkout_symcc(out_path: &Path) -> PathBuf {
     } else {
         let repo_dir = out_path.join("libafl_symcc_src");
         if !repo_dir.exists() {
-            clone_symcc(&repo_dir);
+            // The AFLplusplus/symcc repository was removed from GitHub; a
+            // fresh clone fails. Reuse a previously cloned copy from a
+            // sibling build-script out dir when one exists.
+            let mut cached = None;
+            if let Some(siblings) = out_path.parent().and_then(|p| p.read_dir().ok()) {
+                for entry in siblings.flatten() {
+                    let cand = entry.path().join("out/libafl_symcc_src");
+                    if cand.join("runtime").exists() {
+                        cached = Some(cand);
+                        break;
+                    }
+                }
+            }
+            if let Some(cached) = cached {
+                println!("Copying cached symcc sources from {} ...", cached.display());
+                std::fs::create_dir_all(&repo_dir).expect("failed to create symcc src dir");
+                let status = std::process::Command::new("cp")
+                    .args(["-r"])
+                    .arg(cached.join("."))
+                    .arg(&repo_dir)
+                    .status()
+                    .expect("failed to copy cached symcc sources");
+                assert!(status.success(), "copying cached symcc sources failed");
+            } else {
+                clone_symcc(&repo_dir);
+            }
         }
         repo_dir
     }
@@ -226,6 +251,10 @@ fn build_and_link_symcc_runtime(symcc_src_path: &Path, rename_header_path: &Path
     build_dep_check(&["cmake"]);
     let cpp_lib = cmake::Config::new(symcc_src_path.join("runtime"))
         .define("RUST_BACKEND", "ON")
+        // The C++ simple/qsym backends require Z3; with the rust backend they
+        // are not used at runtime, so trusting the system version (e.g. apt's
+        // libz3-dev, which ships no CMake package config) is sufficient.
+        .define("Z3_TRUST_SYSTEM_VERSION", "ON")
         // 2022: Deprecations break -Werror for our symcc build...
         // We want to build it anyway!
         .cxxflag("-Wno-error=deprecated-declarations")

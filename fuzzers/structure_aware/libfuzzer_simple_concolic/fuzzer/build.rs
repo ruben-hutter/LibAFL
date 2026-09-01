@@ -50,6 +50,35 @@ fn get_or_build_symqemu(out_path: &Path, runtime_lib_dir: &Path) -> PathBuf {
     } else {
         let default_dir = out_path.join("symqemu");
 
+        // Reuse a previously cloned+built standalone SymQEMU from an older
+        // build-script out dir if present (cloning + first build is slow).
+        if !default_dir.exists() {
+            if let Some(siblings) = out_path.parent().and_then(|p| p.read_dir().ok()) {
+                for entry in siblings.flatten() {
+                    let cand = entry.path().join("out/symqemu");
+                    if cand.join("build/qemu-x86_64").exists() {
+                        println!(
+                            "Reusing cached standalone SymQEMU from {} ...",
+                            cand.display()
+                        );
+                        std::fs::create_dir_all(&default_dir).expect("failed to create dir");
+                        let status = std::process::Command::new("cp")
+                            .args(["-r"])
+                            .arg(cand.join("."))
+                            .arg(&default_dir)
+                            .status()
+                            .expect("failed to copy cached SymQEMU");
+                        assert!(status.success(), "copying cached SymQEMU failed");
+                        // Make the copied binary look fresh so the mtime
+                        // comparison below does not trigger a rebuild.
+                        let _ = std::process::Command::new("touch")
+                            .arg(default_dir.join("build").join("qemu-x86_64"));
+                        break;
+                    }
+                }
+            }
+        }
+
         // Clone SymQEMU if it doesn't exist
         if !default_dir.exists() {
             println!("SymQEMU not found, cloning from GitHub...");
@@ -268,8 +297,41 @@ fn main() {
     // === 4. Clone AFL++ SymCC fork (has rust_backend) ===
     let symcc_src_dir = out_path.join("aflpp_symcc_src");
     if !symcc_src_dir.exists() {
-        println!("Cloning AFL++ SymCC fork...");
-        symcc_libafl::clone_symcc(&symcc_src_dir);
+        // The AFLplusplus/symcc repository was removed from GitHub, so a
+        // fresh clone fails. Reuse a previously cloned copy from the
+        // symcc_runtime build cache instead, and only clone as last resort.
+        let mut cached = None;
+        let runtime_build_dir = runtime_dir.join("target/release/build");
+        if let Ok(entries) = std::fs::read_dir(&runtime_build_dir) {
+            for entry in entries.flatten() {
+                let cand = entry.path().join("out/libafl_symcc_src");
+                if cand.join("runtime").exists() {
+                    cached = Some(cand);
+                    break;
+                }
+            }
+        }
+        if let Some(cached) = cached {
+            println!(
+                "Copying cached symcc sources from {} ...",
+                cached.display()
+            );
+            std::fs::create_dir_all(&symcc_src_dir).expect("failed to create symcc src dir");
+            let status = std::process::Command::new("cp")
+                .args(["-r"])
+                .arg(&cached)
+                .arg(".")
+                .current_dir(&out_path)
+                .status()
+                .expect("failed to copy cached symcc sources");
+            assert!(status.success(), "copying cached symcc sources failed");
+            // The cached copy's build/ directory references the old out dir;
+            // remove it so symcc_libafl reconfigures fresh.
+            let _ = std::fs::remove_dir_all(symcc_src_dir.join("build"));
+        } else {
+            println!("Cloning AFL++ SymCC fork...");
+            symcc_libafl::clone_symcc(&symcc_src_dir);
+        }
     }
 
     // === 5. Build AFL++ SymCC runtime with rust_backend ===
