@@ -268,7 +268,7 @@ fn fuzz(
             {
                 println!("ERROR: --use-snapshot requires building with the qemu-snapshot feature:");
                 println!("  source ../snapshot_runner/env.sh && cargo build --release --features qemu-snapshot");
-                return Err(Error::unsupported_option(
+                return Err(Error::invalid_input(
                     "--use-snapshot requires the qemu-snapshot build feature",
                 ));
             }
