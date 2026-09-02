@@ -1,6 +1,23 @@
 # Debugging the restored-execution constraint loss — RESOLVED
 
-**Status: FIXED** (see commit `91670909`). Kept for the postmortem.
+**Status: FIXED** (see commits `91670909` and `e29b3739`). Kept for the
+postmortem.
+
+## Follow-up fix: in-process crash handling (`e29b3739`)
+
+After the PC fix, Z3 quickly solved the full constraint chain and the
+native harness hit the intended NULL deref during mutation evaluation -
+and the process died with 'QEMU internal SIGSEGV' (exit 1). Root cause:
+QEMU's signal_init (at lazy emulator boot) overwrites the fuzzer's
+SIGSEGV handler; the bridge's die_with_signal re-raises the signal
+expecting the fuzzer's handler to catch it, but re-raising into our own
+handler recursed. Fix: signal_init saves pre-existing host actions for
+fatal signals; die_with_signal restores them before re-raising. Plus
+set_target_crash_handling(ReturnToHarness) so guest crashes return as
+QemuExitReason::Crash instead of taking the signal path at all.
+
+Result: the fuzzer finds the crash (objectives stored, crash input =
+the exact Z3 solution) and keeps fuzzing.
 
 ## Root cause
 
