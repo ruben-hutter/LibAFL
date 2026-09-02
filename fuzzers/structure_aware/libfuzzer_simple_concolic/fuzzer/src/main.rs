@@ -455,6 +455,11 @@ mod snapshot_concolic {
                     SymQemuModule::new(0, GUEST_INPUT_FILE_SIZE)
                 ));
             let mut emulator = builder.build()?;
+            // Guest crashes (e.g. the harness's intended NULL deref once Z3
+            // solves the full chain) return cleanly from qemu.run() as
+            // QemuExitReason::Crash instead of killing the process; the
+            // snapshot restore recovers the guest for the next iteration.
+            emulator.set_target_crash_handling(&libafl_qemu::TargetSignalHandling::ReturnToHarness);
 
             eprintln!("[snapshot-executor] init: emulator built, resolving entry");
             let qemu = emulator.qemu();
