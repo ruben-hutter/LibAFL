@@ -435,9 +435,14 @@ mod snapshot_concolic {
             let mut elf_buffer = Vec::new();
             let elf = EasyElf::from_file(qemu.binary_path(), &mut elf_buffer)?;
             // Snapshot entry point: symbol name, resolved against the guest
-            // load base at runtime (override via SNAPSHOT_TARGET_FUNCTION).
+            // load base at runtime. Precedence: SNAPSHOT_TARGET_FUNCTION env
+            // var > SNAPSHOT_DEFAULT_FUNCTION (set in build.rs) > fallback.
             let target_function = std::env::var("SNAPSHOT_TARGET_FUNCTION")
-                .unwrap_or_else(|_| "LLVMFuzzerTestOneInput".to_string());
+                .unwrap_or_else(|_| {
+                    option_env!("SNAPSHOT_DEFAULT_FUNCTION")
+                        .unwrap_or("LLVMFuzzerTestOneInput")
+                        .to_string()
+                });
             let entry = elf
                 .resolve_symbol(&target_function, qemu.load_addr())
                 .ok_or_else(|| {
@@ -465,10 +470,6 @@ mod snapshot_concolic {
                 .read_reg(Regs::Rdi)
                 .map_err(|e| Error::invalid_input(format!("failed to read RDI: {e:?}")))?
                 .into();
-            let size: u64 = qemu
-                .read_reg(Regs::Rsi)
-                .map_err(|e| Error::invalid_input(format!("failed to read RSI: {e:?}")))?
-                .into();
             let sp: u64 = qemu
                 .read_reg(Regs::Sp)
                 .map_err(|e| Error::invalid_input(format!("failed to read SP: {e:?}")))?
@@ -478,7 +479,11 @@ mod snapshot_concolic {
                 .map_err(|e| Error::invalid_input(format!("failed to read return address: {e:?}")))?;
             let ret_addr = u64::from_le_bytes(ret_addr_buf);
 
-            let buffer_size = (size as usize).min(GUEST_INPUT_FILE_SIZE);
+            // The buffer size is NOT taken from RSI: at e.g. foo(data, ptr)
+            // the second register holds the (NULL) ptr argument, not a size.
+            // guest main() always mallocs exactly GUEST_INPUT_FILE_SIZE bytes
+            // (the dummy file we wrote), so that is the allocated size.
+            let buffer_size = GUEST_INPUT_FILE_SIZE;
 
             eprintln!("[snapshot-executor] init: capturing snapshot");
             // === capture the snapshot at the entry point ===
