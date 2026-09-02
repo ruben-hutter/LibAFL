@@ -54,7 +54,22 @@ impl ConcolicObserver<'_> {
         println!("  SUCCESS: Parsing {} bytes of concolic trace...", buffer.len());
         let metadata = ConcolicMetadata::from_buffer(buffer);
         let expr_count = metadata.iter_messages().count();
-        println!("  SUCCESS: Parsed {} symbolic expressions", expr_count);
+        // Histogram over expression kinds - shows at a glance whether a
+        // trace contains path constraints (required for Z3) or only input
+        // bytes.
+        let mut kinds: alloc::collections::btree_map::BTreeMap<&'static str, usize> =
+            alloc::collections::btree_map::BTreeMap::new();
+        for (_id, msg) in metadata.iter_messages() {
+            let name = match msg {
+                crate::observers::concolic::SymExpr::InputByte { .. } => "InputByte",
+                crate::observers::concolic::SymExpr::PathConstraint { .. } => "PathConstraint",
+                crate::observers::concolic::SymExpr::Equal { .. } => "Equal",
+                crate::observers::concolic::SymExpr::Integer { .. } => "Integer",
+                _ => "other",
+            };
+            *kinds.entry(name).or_insert(0) += 1;
+        }
+        println!("  SUCCESS: Parsed {} symbolic expressions {:?}", expr_count, kinds);
 
         metadata
     }

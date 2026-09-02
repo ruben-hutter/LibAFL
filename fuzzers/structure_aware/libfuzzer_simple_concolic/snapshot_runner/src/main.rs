@@ -34,6 +34,12 @@ use libafl_qemu::{
     Emulator, QemuExitError, QemuExitReason, Regs,
 };
 
+unsafe extern "C" {
+    fn libafl_flush_jit();
+    fn _libafl_sym_reset_state();
+    fn _libafl_sym_reset_state_debug(probe: *mut u8);
+}
+
 /// The `harness_snapshot.c` magic prefix that steers execution into `foo()`
 /// (nested comparisons that are only solvable with symbolic reasoning).
 const FOO_PREFIX: [u8; 4] = *b"QEMU";
@@ -77,11 +83,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // attaches to it lazily on the first _rsym_* call.
     unsafe { concolic_shmem.write_to_env(DEFAULT_ENV_NAME)? };
 
-    let qemu_args = vec![
-        "qemu-x86_64".to_string(),
-        opt.binary.clone(),
-        "dummy_input.bin".to_string(),
-    ];
+    let mut qemu_args = vec!["qemu-x86_64".to_string()];
+    if std::env::var_os("SNAPSHOT_TRACE_TCG").is_some() {
+        qemu_args.push("-d".into());
+        qemu_args.push("in_asm,op".into());
+        qemu_args.push("-D".into());
+        qemu_args.push("/tmp/opencode/guest_tcg_smoke.log".into());
+    }
+    qemu_args.push(opt.binary.clone());
+    qemu_args.push("dummy_input.bin".to_string());
 
     let builder =
         Emulator::<(), _, _, (), libafl::inputs::BytesInput, (), _>::empty()
@@ -159,12 +169,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             input
         );
 
-        // === 3a. restore snapshot ===
-        emulator
-            .modules_mut()
-            .get_mut::<SnapshotModule>()
-            .unwrap()
-            .reset(qemu);
+        // === 3a. EXPERIMENT: NO restore — run on live guest state ===
+        if std::env::var_os("SMOKE_NO_RESTORE").is_none() {
+            emulator
+                .modules_mut()
+                .get_mut::<SnapshotModule>()
+                .unwrap()
+                .reset(qemu);
+            unsafe {
+                _libafl_sym_reset_state_debug(0x55555555c494 as *mut u8);
+                libafl_flush_jit();
+                _libafl_sym_reset_state();
+            }
+        } else {
+            println!("[experiment] SNAPSHOT RESTORE SKIPPED this iteration");
+        }
 
         // Start a fresh trace (the previous iteration's trace was consumed).
         // SAFETY: runtime lives in this process.

@@ -364,6 +364,21 @@ mod snapshot_concolic {
         fn _libafl_concolic_begin_trace();
     }
 
+    // Provided by the hybrid libqemu-x86_64.so: flush the guest TB cache.
+    // Symbolic expression temps cached inside translated blocks hold ids from
+    // the PREVIOUS execution; re-using them after a snapshot restore writes
+    // stale references into the current trace (the reader then truncates it).
+    // Flushing forces re-translation with clean symbolic state.
+    unsafe extern "C" {
+        fn libafl_flush_jit();
+    }
+
+    // Provided by the hybrid shim (libSymCCRtShared.so): zero all symbolic
+    // state (CPU env_exprs region + memory shadow pages).
+    unsafe extern "C" {
+        fn _libafl_sym_reset_state();
+    }
+
     /// Size of the dummy input file used to boot the guest; the harness
     /// mallocs its input buffer from the file size, so this is also the
     /// maximum input length applied per execution.
@@ -395,6 +410,16 @@ mod snapshot_concolic {
     }
 
     impl<OT> SnapshotConcolicExecutor<OT> {
+        /// Content of the dummy input file. The guest main() only routes into
+        /// foo() (our default snapshot entry) when the input starts with
+        /// "QEMU", so the initial concrete run actually reaches the entry
+        /// breakpoint.
+        fn guest_input_file_content() -> Vec<u8> {
+            let mut content = vec![0u8; GUEST_INPUT_FILE_SIZE];
+            content[..4].copy_from_slice(b"QEMU");
+            content
+        }
+
         pub fn new(observers: OT) -> Self {
             Self {
                 observers,
@@ -408,17 +433,21 @@ mod snapshot_concolic {
             // is irrelevant (overwritten per execution), only the size
             // determines the buffer allocation.
             eprintln!("[snapshot-executor] init: writing guest input file");
-            fs::write("cur_input", vec![0u8; GUEST_INPUT_FILE_SIZE])?;
+            fs::write("cur_input", Self::guest_input_file_content())?;
 
             // Guest binary for the snapshot flow (built by build.rs from
             // harness_snapshot.c; override with SNAPSHOT_TARGET_BIN).
             let guest_bin = std::env::var("SNAPSHOT_TARGET_BIN")
                 .unwrap_or_else(|_| "./target_snapshot.out".to_string());
-            let qemu_args = vec![
-                "qemu-x86_64".to_string(),
-                guest_bin,
-                "cur_input".to_string(),
-            ];
+            let mut qemu_args = vec!["qemu-x86_64".to_string()];
+            if std::env::var_os("SNAPSHOT_TRACE_TCG").is_some() {
+                qemu_args.push("-d".into());
+                qemu_args.push("in_asm,op".into());
+                qemu_args.push("-D".into());
+                qemu_args.push("/tmp/opencode/guest_tcg.log".into());
+            }
+            qemu_args.push(guest_bin);
+            qemu_args.push("cur_input".to_string());
 
             eprintln!("[snapshot-executor] init: building emulator (QEMU init)");
             let builder = Emulator::<(), _, _, (), BytesInput, (), _>::empty()
@@ -458,6 +487,12 @@ mod snapshot_concolic {
             let exit = unsafe { qemu.run() };
             match exit {
                 Ok(QemuExitReason::Breakpoint(_)) => {}
+                Ok(QemuExitReason::End(_)) => {
+                    return Err(Error::invalid_input(format!(
+                        "the guest exited before reaching the entry function '{target_function}' - \
+                         the input file content does not route execution into it"
+                    )))
+                }
                 other => {
                     return Err(Error::invalid_input(format!(
                         "unexpected QEMU exit while running to entry: {other:?}"
@@ -555,6 +590,13 @@ mod snapshot_concolic {
                 .get_mut::<SnapshotModule>()
                 .expect("SnapshotModule in tuple")
                 .reset(inner.qemu);
+            // SAFETY: bridge/shim exports; drop stale symbolic ids (CPU
+            // env_exprs, memory shadow, cached TBs) so this trace only
+            // references expressions created during THIS execution.
+            unsafe {
+                libafl_flush_jit();
+                _libafl_sym_reset_state();
+            }
 
             // === write the input into the guest buffer ===
             let bytes = input.target_bytes();
