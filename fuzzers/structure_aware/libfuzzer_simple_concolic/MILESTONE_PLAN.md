@@ -91,6 +91,15 @@ executor.
   feature build and skips the standalone SymQEMU/SymCC steps; runtime
   sources are watched via rerun-if-changed (they silently went stale once).
 
+### Final fix (post-audit): restored-execution constraint loss [RESOLVED]
+
+`SnapshotModule::reset` restores RAM/mappings but NOT the PC: iterations
+after the first resumed AT the still-armed return breakpoint and executed
+ZERO guest instructions (traces = marking-only, Z3 starved; visible in
+hindsight via ~17us vs ~600us iteration timings). Fixed by rewriting
+Rip/Rsp/Rdi/Rsi after every restore (fuzzbench_qemu pattern). See
+DEBUGGING.md for the full postmortem.
+
 ### Phase 4 — End-to-end validation [DONE]
 - `just run-snapshot` runs broker + concolic client(s) in tmux
   (`just kill-fuzz` to stop). Full loop verified live: run-to-entry,
