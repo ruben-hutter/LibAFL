@@ -353,7 +353,7 @@ mod snapshot_concolic {
         command::NopCommandManager,
         elf::EasyElf,
         modules::{usermode::SnapshotModule, SymQemuModule},
-        Emulator, NopEmulatorDriver, NopSnapshotManager, Qemu, QemuExitError,
+        Emulator, GuestReg, NopEmulatorDriver, NopSnapshotManager, Qemu, QemuExitError,
         QemuExitReason, Regs,
     };
 
@@ -362,15 +362,6 @@ mod snapshot_concolic {
     unsafe extern "C" {
         fn _libafl_concolic_end_trace();
         fn _libafl_concolic_begin_trace();
-    }
-
-    // Provided by the hybrid libqemu-x86_64.so: flush the guest TB cache.
-    // Symbolic expression temps cached inside translated blocks hold ids from
-    // the PREVIOUS execution; re-using them after a snapshot restore writes
-    // stale references into the current trace (the reader then truncates it).
-    // Flushing forces re-translation with clean symbolic state.
-    unsafe extern "C" {
-        fn libafl_flush_jit();
     }
 
     // Provided by the hybrid shim (libSymCCRtShared.so): zero all symbolic
@@ -396,6 +387,13 @@ mod snapshot_concolic {
                 NopSnapshotManager,
             >,
         qemu: Qemu,
+        /// Entry address of the snapshot function.
+        entry: u64,
+        /// Guest register values captured at the entry breakpoint. The
+        /// snapshot restore does NOT rewind the PC (or any register), so
+        /// these are rewritten explicitly before every execution.
+        sp: u64,
+        rsi: u64,
         buffer: u64,
         buffer_size: usize,
         #[allow(dead_code)]
@@ -509,6 +507,10 @@ mod snapshot_concolic {
                 .read_reg(Regs::Sp)
                 .map_err(|e| Error::invalid_input(format!("failed to read SP: {e:?}")))?
                 .into();
+            let rsi: u64 = qemu
+                .read_reg(Regs::Rsi)
+                .map_err(|e| Error::invalid_input(format!("failed to read RSI: {e:?}")))?
+                .into();
             let mut ret_addr_buf = [0u8; 8];
             qemu.read_mem(sp, &mut ret_addr_buf)
                 .map_err(|e| Error::invalid_input(format!("failed to read return address: {e:?}")))?;
@@ -550,6 +552,9 @@ mod snapshot_concolic {
             self.inner = Some(Inner {
                 emulator,
                 qemu,
+                entry,
+                sp,
+                rsi,
                 buffer,
                 buffer_size,
                 ret_addr,
@@ -590,13 +595,29 @@ mod snapshot_concolic {
                 .get_mut::<SnapshotModule>()
                 .expect("SnapshotModule in tuple")
                 .reset(inner.qemu);
-            // SAFETY: bridge/shim exports; drop stale symbolic ids (CPU
-            // env_exprs, memory shadow, cached TBs) so this trace only
-            // references expressions created during THIS execution.
-            unsafe {
-                libafl_flush_jit();
-                _libafl_sym_reset_state();
-            }
+
+            // SnapshotModule::reset restores guest RAM/mappings but NOT the
+            // CPU registers: after the previous run stopped at the return
+            // breakpoint, the PC still sits AT that (still armed) breakpoint.
+            // Rewrite the resume state explicitly (fuzzbench_qemu pattern),
+            // otherwise the run below returns immediately without executing
+            // a single guest instruction.
+            let qemu = inner.qemu;
+            qemu.write_reg(Regs::Rip, inner.entry as GuestReg)
+                .map_err(|e| Error::invalid_input(format!("failed to set RIP: {e:?}")))?;
+            qemu.write_reg(Regs::Sp, inner.sp as GuestReg)
+                .map_err(|e| Error::invalid_input(format!("failed to set RSP: {e:?}")))?;
+            qemu.write_reg(Regs::Rdi, inner.buffer as GuestReg)
+                .map_err(|e| Error::invalid_input(format!("failed to set RDI: {e:?}")))?;
+            qemu.write_reg(Regs::Rsi, inner.rsi as GuestReg)
+                .map_err(|e| Error::invalid_input(format!("failed to set RSI: {e:?}")))?;
+
+            // SAFETY: shim export; drop stale symbolic ids (CPU env_exprs,
+            // memory shadow) so this trace only references expressions
+            // created during THIS execution. The translated blocks
+            // themselves carry no persistent symbolic state, so no JIT
+            // flush is needed.
+            unsafe { _libafl_sym_reset_state() };
 
             // === write the input into the guest buffer ===
             let bytes = input.target_bytes();

@@ -31,13 +31,11 @@ use libafl_bolts::{
 use libafl_qemu::{
     elf::EasyElf,
     modules::{usermode::SnapshotModule, SymQemuModule},
-    Emulator, QemuExitError, QemuExitReason, Regs,
+    Emulator, GuestReg, QemuExitError, QemuExitReason, Regs,
 };
 
 unsafe extern "C" {
-    fn libafl_flush_jit();
     fn _libafl_sym_reset_state();
-    fn _libafl_sym_reset_state_debug(probe: *mut u8);
 }
 
 /// The `harness_snapshot.c` magic prefix that steers execution into `foo()`
@@ -169,21 +167,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             input
         );
 
-        // === 3a. EXPERIMENT: NO restore — run on live guest state ===
+        // === 3a. restore the snapshot (RAM/mappings; opt-out for A/B tests) ===
         if std::env::var_os("SMOKE_NO_RESTORE").is_none() {
             emulator
                 .modules_mut()
                 .get_mut::<SnapshotModule>()
                 .unwrap()
                 .reset(qemu);
-            unsafe {
-                _libafl_sym_reset_state_debug(0x55555555c494 as *mut u8);
-                libafl_flush_jit();
-                _libafl_sym_reset_state();
-            }
+            // SAFETY: drop stale symbolic ids before re-marking.
+            unsafe { _libafl_sym_reset_state() };
         } else {
             println!("[experiment] SNAPSHOT RESTORE SKIPPED this iteration");
         }
+
+        // SnapshotModule::reset restores guest RAM/mappings but NOT the CPU
+        // registers: after the previous run stopped at the (still armed)
+        // return breakpoint, the PC sits AT that breakpoint. Rewrite the
+        // resume state explicitly, otherwise qemu.run() below returns
+        // immediately without executing a single guest instruction.
+        qemu.write_reg(Regs::Rip, entry as GuestReg)
+            .expect("set RIP");
+        qemu.write_reg(Regs::Sp, sp as GuestReg)
+            .expect("set RSP");
+        qemu.write_reg(Regs::Rdi, buffer as GuestReg)
+            .expect("set RDI");
+        qemu.write_reg(Regs::Rsi, size as GuestReg)
+            .expect("set RSI");
 
         // Start a fresh trace (the previous iteration's trace was consumed).
         // SAFETY: runtime lives in this process.

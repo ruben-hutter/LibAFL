@@ -115,6 +115,9 @@ run-snapshot num_regular="0" num_concolic="1" target_function="":
     source snapshot_runner/env.sh
     cd fuzzer
     cargo build --release --features qemu-snapshot
+    # A plain (non-feature) build re-copies OLD standalone-mode shims into
+    # fuzzer/; they would shadow the fresh hybrid shim via LD_LIBRARY_PATH.
+    rm -f libSymCCRtShared.so libSymRuntime.so
     if [ -n "{{target_function}}" ]; then
         export SNAPSHOT_TARGET_FUNCTION="{{target_function}}"
         echo "Snapshot entry point: {{target_function}}"
