@@ -3192,9 +3192,10 @@ where
                 .alloc_next(size_of::<LlmpClientExitInfo>())
                 .expect("Could not allocate a new message in shared map.");
             (*msg).tag = LLMP_TAG_CLIENT_EXIT;
-            let mut exitinfo =
-                ((*msg).buf.as_mut_ptr() as *mut LlmpClientExitInfo).read_unaligned();
+            let exitinfo_ptr = (*msg).buf.as_mut_ptr() as *mut LlmpClientExitInfo;
+            let mut exitinfo = exitinfo_ptr.read_unaligned();
             exitinfo.client_id = client_id;
+            exitinfo_ptr.write_unaligned(exitinfo);
             sender.send(msg, true)
         }
     }

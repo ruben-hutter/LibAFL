@@ -332,7 +332,13 @@ impl<W: Write + Seek> MessageFileWriter<W> {
     }
 
     fn make_relative(&self, expr: SymExprRef) -> SymExprRef {
-        SymExprRef::new(self.id_counter - expr.get()).unwrap()
+        SymExprRef::new(self.id_counter - expr.get()).unwrap_or_else(|| {
+            panic!(
+                "forward reference to expression id {} (current id counter: {})",
+                expr.get(),
+                self.id_counter
+            )
+        })
     }
 
     /// Writes a message to the stream and returns the [`SymExprRef`] that should be used to refer back to this message.
