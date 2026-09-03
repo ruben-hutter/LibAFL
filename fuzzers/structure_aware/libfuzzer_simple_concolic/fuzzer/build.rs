@@ -432,8 +432,9 @@ fn main() {
             panic!("qemu-snapshot feature requires LIBAFL_QEMU_DIR pointing at the hybrid QEMU tree (see snapshot_runner/env.sh)");
         }
         // Default snapshot entry function (runtime override:
-        // SNAPSHOT_TARGET_FUNCTION env var).
-        println!("cargo:rustc-env=SNAPSHOT_DEFAULT_FUNCTION=foo");
+        // SNAPSHOT_TARGET_FUNCTION env var). Must be a function whose first
+        // argument is the input data buffer (libFuzzer convention).
+        println!("cargo:rustc-env=SNAPSHOT_DEFAULT_FUNCTION=LLVMFuzzerTestOneInput");
     }
 
     println!("Build completed successfully!");

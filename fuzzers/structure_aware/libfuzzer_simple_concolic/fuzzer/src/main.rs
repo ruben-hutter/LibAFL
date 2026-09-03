@@ -283,7 +283,7 @@ fn fuzz(
             let mut stages = tuple_list!(
                 // Create a concolic trace using SymCC (compile-time instrumentation)
                 ConcolicTracingStage::new(
-                    TracingStage::new(MyCommandConfiguratorSymCC.into_executor(
+                    TracingStage::new(MyCommandConfiguratorSymCC::default().into_executor(
                         tuple_list!(concolic_observer),
                         None,
                         None
@@ -301,7 +301,7 @@ fn fuzz(
             let mut stages = tuple_list!(
                 // Create a concolic trace using SymQEMU (runtime instrumentation)
                 ConcolicTracingStage::new(
-                    TracingStage::new(MyCommandConfiguratorSymQEMU.into_executor(
+                    TracingStage::new(MyCommandConfiguratorSymQEMU::default().into_executor(
                         tuple_list!(concolic_observer),
                         None,
                         None
@@ -353,8 +353,9 @@ mod snapshot_concolic {
         command::NopCommandManager,
         elf::EasyElf,
         modules::{usermode::SnapshotModule, SymQemuModule},
-        Emulator, GuestReg, NopEmulatorDriver, NopSnapshotManager, Qemu, QemuExitError,
-        QemuExitReason, Regs,
+        sys::CPUArchState,
+        Emulator, NopEmulatorDriver, NopSnapshotManager, Qemu, QemuExitError, QemuExitReason,
+        Regs,
     };
 
     // Control hooks provided by libSymRuntime.so (linked via build.rs):
@@ -387,15 +388,28 @@ mod snapshot_concolic {
                 NopSnapshotManager,
             >,
         qemu: Qemu,
-        /// Entry address of the snapshot function.
-        entry: u64,
-        /// Guest register values captured at the entry breakpoint. The
-        /// snapshot restore does NOT rewind the PC (or any register), so
-        /// these are rewritten explicitly before every execution.
-        sp: u64,
-        rsi: u64,
+        /// Full architectural CPU state captured at the entry breakpoint.
+        /// `CPUArchState` is the bindgen'd `CPUX86State`: all 16 GPRs, RIP,
+        /// RFLAGS, segment registers (including FS/GS bases), GDT/IDT/LDT/TSS,
+        /// CR/DR registers, x87 FPU stack + control/status, XMM/YMM state,
+        /// MXCSR, MSRs and the TCG-internal lazy-flag fields. Neither
+        /// `SnapshotModule::reset` nor anything else rewinds the CPU, so this
+        /// state is restored before every execution. Saving the whole env
+        /// (instead of rewriting individual argument registers) makes the
+        /// reset correct for ANY harness: arbitrary calling conventions and
+        /// argument registers, stack-passed arguments (restored with the
+        /// stack RAM by the snapshot), SSE/AVX-using code, and functions
+        /// that observe flags or callee-saved registers.
+        saved_cpu: CPUArchState,
         buffer: u64,
         buffer_size: usize,
+        /// Guest input-buffer content at snapshot time. The buffer page is
+        /// only ever written host-side (write_mem), which does NOT mark it
+        /// dirty in SnapshotModule's hook-based tracking - so reset() would
+        /// leave bytes from PREVIOUS inputs in place ([len, buffer_size)
+        /// tail). Restoring this copy first makes every iteration start
+        /// from the exact snapshot-time buffer state.
+        snapshot_buffer: Vec<u8>,
         #[allow(dead_code)]
         ret_addr: u64,
         traced_before: bool,
@@ -503,7 +517,18 @@ mod snapshot_concolic {
                 }
             }
 
-            eprintln!("[snapshot-executor] init: reached entry, reading regs");
+            eprintln!("[snapshot-executor] init: reached entry, capturing CPU state");
+            // Save the COMPLETE CPU state while stopped at the entry
+            // breakpoint (pre-first-instruction): every iteration is reset
+            // to exactly this state. Take it before any other register
+            // access so nothing can perturb the snapshot.
+            let cpu = qemu
+                .current_cpu()
+                .or_else(|| qemu.cpu_from_index(0))
+                .ok_or_else(|| Error::invalid_input("no QEMU CPU found"))?;
+            let saved_cpu = cpu.save_state();
+
+            eprintln!("[snapshot-executor] init: reading regs");
             let buffer: u64 = qemu
                 .read_reg(Regs::Rdi)
                 .map_err(|e| Error::invalid_input(format!("failed to read RDI: {e:?}")))?
@@ -511,10 +536,6 @@ mod snapshot_concolic {
             let sp: u64 = qemu
                 .read_reg(Regs::Sp)
                 .map_err(|e| Error::invalid_input(format!("failed to read SP: {e:?}")))?
-                .into();
-            let rsi: u64 = qemu
-                .read_reg(Regs::Rsi)
-                .map_err(|e| Error::invalid_input(format!("failed to read RSI: {e:?}")))?
                 .into();
             let mut ret_addr_buf = [0u8; 8];
             qemu.read_mem(sp, &mut ret_addr_buf)
@@ -526,6 +547,20 @@ mod snapshot_concolic {
             // guest main() always mallocs exactly GUEST_INPUT_FILE_SIZE bytes
             // (the dummy file we wrote), so that is the allocated size.
             let buffer_size = GUEST_INPUT_FILE_SIZE;
+
+            // Capture the snapshot-time buffer content. The buffer page is
+            // never written by guest code, so SnapshotModule's dirty-page
+            // tracking never restores it; without this, bytes beyond the
+            // current input length leak in from previous iterations.
+            let mut snapshot_buffer = vec![0u8; buffer_size];
+            qemu.read_mem(buffer, &mut snapshot_buffer).map_err(|e| {
+                Error::invalid_input(format!(
+                    "failed to read the input buffer {buffer:#x} (size {buffer_size}) \
+                     at entry function '{target_function}' (RDI={buffer:#x}): {e:?} - the \
+                     snapshot entry must be a function whose first argument is the \
+                     input data buffer; set SNAPSHOT_TARGET_FUNCTION accordingly"
+                ))
+            })?;
 
             eprintln!("[snapshot-executor] init: capturing snapshot");
             // === capture the snapshot at the entry point ===
@@ -557,11 +592,10 @@ mod snapshot_concolic {
             self.inner = Some(Inner {
                 emulator,
                 qemu,
-                entry,
-                sp,
-                rsi,
+                saved_cpu,
                 buffer,
                 buffer_size,
+                snapshot_buffer,
                 ret_addr,
                 traced_before: false,
             });
@@ -601,21 +635,21 @@ mod snapshot_concolic {
                 .expect("SnapshotModule in tuple")
                 .reset(inner.qemu);
 
-            // SnapshotModule::reset restores guest RAM/mappings but NOT the
-            // CPU registers: after the previous run stopped at the return
-            // breakpoint, the PC still sits AT that (still armed) breakpoint.
-            // Rewrite the resume state explicitly (fuzzbench_qemu pattern),
-            // otherwise the run below returns immediately without executing
-            // a single guest instruction.
-            let qemu = inner.qemu;
-            qemu.write_reg(Regs::Rip, inner.entry as GuestReg)
-                .map_err(|e| Error::invalid_input(format!("failed to set RIP: {e:?}")))?;
-            qemu.write_reg(Regs::Sp, inner.sp as GuestReg)
-                .map_err(|e| Error::invalid_input(format!("failed to set RSP: {e:?}")))?;
-            qemu.write_reg(Regs::Rdi, inner.buffer as GuestReg)
-                .map_err(|e| Error::invalid_input(format!("failed to set RDI: {e:?}")))?;
-            qemu.write_reg(Regs::Rsi, inner.rsi as GuestReg)
-                .map_err(|e| Error::invalid_input(format!("failed to set RSI: {e:?}")))?;
+            // SnapshotModule::reset restores guest RAM, mappings, mprotect
+            // states, brk and mmap layout — but NOT the CPU. Restore the
+            // complete architectural CPU state captured at the entry
+            // breakpoint: every GPR, RIP, RFLAGS, segment registers with
+            // bases, x87 FPU, XMM/YMM, MXCSR and the lazy-flag internals.
+            // This re-enters the target function from a state identical to
+            // the first execution, for any harness and calling convention.
+            // (LibAFL breakpoints live outside the env struct, so the armed
+            // return-address breakpoint survives the restore.)
+            inner
+                .qemu
+                .current_cpu()
+                .or_else(|| inner.qemu.cpu_from_index(0))
+                .ok_or_else(|| Error::invalid_input("no QEMU CPU found"))?
+                .restore_state(&inner.saved_cpu);
 
             // SAFETY: shim export; drop stale symbolic ids (CPU env_exprs,
             // memory shadow) so this trace only references expressions
@@ -625,12 +659,19 @@ mod snapshot_concolic {
             unsafe { _libafl_sym_reset_state() };
 
             // === write the input into the guest buffer ===
+            // First restore the FULL buffer to its snapshot-time content:
+            // SnapshotModule::reset never rewrites this page (it is only
+            // ever written host-side, so it is never marked dirty), and
+            // leaving stale bytes in [len, buffer_size) would let previous
+            // inputs' data leak into this execution. Then overlay the input.
             let bytes = input.target_bytes();
             let buf = AsSlice::as_slice(&bytes);
             let len = buf.len().min(inner.buffer_size);
+            let mut guest_buffer = inner.snapshot_buffer.clone();
+            guest_buffer[..len].copy_from_slice(&buf[..len]);
             inner
                 .qemu
-                .write_mem(inner.buffer, &buf[..len])
+                .write_mem(inner.buffer, &guest_buffer)
                 .map_err(|e| Error::invalid_input(format!("failed to write guest input: {e:?}")))?;
 
             // === mark the (input-length prefix of the) buffer symbolic ===
@@ -688,7 +729,9 @@ mod snapshot_concolic {
 use snapshot_concolic::SnapshotConcolicExecutor;
 
 #[derive(Default, Debug)]
-pub struct MyCommandConfiguratorSymQEMU;
+pub struct MyCommandConfiguratorSymQEMU {
+    timeout: Duration,
+}
 
 impl CommandConfigurator<Child> for MyCommandConfiguratorSymQEMU {
     fn spawn_child(&mut self, target_bytes: OwnedSlice<'_, u8>) -> Result<Child, Error> {
@@ -724,17 +767,18 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymQEMU {
     }
 
     fn exec_timeout(&self) -> Duration {
-        Duration::from_secs(5)
+        self.timeout
     }
 
     fn exec_timeout_mut(&mut self) -> &mut Duration {
-        static mut TIMEOUT: Duration = Duration::from_secs(5);
-        unsafe { &mut TIMEOUT }
+        &mut self.timeout
     }
 }
 
 #[derive(Default, Debug)]
-pub struct MyCommandConfiguratorSymCC;
+pub struct MyCommandConfiguratorSymCC {
+    timeout: Duration,
+}
 
 impl CommandConfigurator<Child> for MyCommandConfiguratorSymCC {
     fn spawn_child(&mut self, target_bytes: OwnedSlice<'_, u8>) -> Result<Child, Error> {
@@ -755,12 +799,11 @@ impl CommandConfigurator<Child> for MyCommandConfiguratorSymCC {
     }
 
     fn exec_timeout(&self) -> Duration {
-        Duration::from_secs(5)
+        self.timeout
     }
 
     fn exec_timeout_mut(&mut self) -> &mut Duration {
-        static mut TIMEOUT: Duration = Duration::from_secs(5);
-        unsafe { &mut TIMEOUT }
+        &mut self.timeout
     }
 }
 

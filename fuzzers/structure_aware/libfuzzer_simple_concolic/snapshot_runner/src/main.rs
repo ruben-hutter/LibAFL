@@ -4,13 +4,14 @@
 //! Flow:
 //! 1. Start the emulator on the guest binary and run to `LLVMFuzzerTestOneInput`
 //!    (breakpoint). The guest runs "normally" until this entry point.
-//! 2. Capture a full snapshot (CPU + RAM) via [`SnapshotModule`], remember the
-//!    input buffer (RDI), size (RSI), stack pointer and return address.
-//! 3. For each test input: restore the snapshot, write the input into the
-//!    guest buffer, mark it symbolic via the SymCC runtime, then resume
-//!    execution until the return-address breakpoint. The symbolic runtime
-//!    (rlib-linked into this process) writes a concolic trace into shared
-//!    memory; we read it back after every execution and report statistics.
+//! 2. Save the complete CPU state (`CPUArchState`) at the entry breakpoint and
+//!    capture a full RAM/mappings snapshot via [`SnapshotModule`]; remember the
+//!    input buffer (RDI) and return address.
+//! 3. For each test input: restore the snapshot and the saved CPU state, write
+//!    the input into the guest buffer, mark it symbolic via the SymCC runtime,
+//!    then resume execution until the return-address breakpoint. The symbolic
+//!    runtime (rlib-linked into this process) writes a concolic trace into
+//!    shared memory; we read it back after every execution and report statistics.
 //!
 //! Build against the hybrid QEMU tree:
 //! ```sh
@@ -31,7 +32,8 @@ use libafl_bolts::{
 use libafl_qemu::{
     elf::EasyElf,
     modules::{usermode::SnapshotModule, SymQemuModule},
-    Emulator, GuestReg, QemuExitError, QemuExitReason, Regs,
+    sys::CPUArchState,
+    Emulator, QemuExitError, QemuExitReason, Regs,
 };
 
 unsafe extern "C" {
@@ -99,6 +101,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SymQemuModule::new(0, 4096)
         ));
     let mut emulator = builder.build()?;
+    // Match the fuzzer's crash handling: guest faults return cleanly from
+    // qemu.run() as QemuExitReason::Crash instead of killing the process;
+    // the snapshot restore recovers the guest for the next iteration.
+    emulator.set_target_crash_handling(&libafl_qemu::TargetSignalHandling::ReturnToHarness);
 
     let qemu = emulator.qemu();
 
@@ -118,9 +124,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Save the COMPLETE CPU state while stopped at the entry breakpoint
+    // (pre-first-instruction): every iteration is reset to exactly this
+    // state. CPUArchState == CPUX86State: all GPRs, RIP, RFLAGS, segments
+    // (incl. FS/GS bases), x87 FPU, XMM/YMM, MXCSR, lazy-flag internals.
+    let cpu = qemu
+        .current_cpu()
+        .or_else(|| qemu.cpu_from_index(0))
+        .expect("no QEMU CPU found");
+    let saved_cpu: CPUArchState = cpu.save_state();
+
     let buffer: u64 = qemu.read_reg(Regs::Rdi).expect("read RDI").into();
     let size: u64 = qemu.read_reg(Regs::Rsi).expect("read RSI").into();
     let sp: u64 = qemu.read_reg(Regs::Sp).expect("read SP").into();
+
+    // Capture the snapshot-time buffer content. The buffer page is never
+    // written by guest code, so SnapshotModule's dirty-page tracking never
+    // restores it; without this, bytes beyond the current input length leak
+    // in from previous iterations (e.g. a crashing input's solution bytes
+    // would make a later short input crash "impossibly").
+    let mut snapshot_buffer = vec![0u8; size as usize];
+    qemu.read_mem(buffer, &mut snapshot_buffer)
+        .expect("read snapshot-time buffer");
     let mut ret_addr_buf = [0u8; 8];
     qemu.read_mem(sp, &mut ret_addr_buf).expect("read ret addr");
     let ret_addr = u64::from_le_bytes(ret_addr_buf);
@@ -158,6 +183,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .concat(),
         // goes to bar()
         vec![0x00; 16],
+        // short inputs: exercise the `size < 16` early return
+        b"QEMU".to_vec(),
+        vec![0x00; 4],
+        // crash the guest (full solution chain -> NULL deref in foo()), then
+        // keep tracing short inputs afterwards: regression test for the
+        // stale-buffer-tail bug (buffer must be restored to snapshot state,
+        // not keep the crash input's solution bytes at [4..])
+        b"QEMUB\x13\x37\xe9\x14\x7f\x80AAAAAAA".to_vec(),
+        vec![0x00; 4],
+        b"QEMU".to_vec(),
     ];
 
     for (i, input) in inputs.iter().take(opt.iterations + 1).enumerate() {
@@ -180,19 +215,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[experiment] SNAPSHOT RESTORE SKIPPED this iteration");
         }
 
-        // SnapshotModule::reset restores guest RAM/mappings but NOT the CPU
-        // registers: after the previous run stopped at the (still armed)
-        // return breakpoint, the PC sits AT that breakpoint. Rewrite the
-        // resume state explicitly, otherwise qemu.run() below returns
-        // immediately without executing a single guest instruction.
-        qemu.write_reg(Regs::Rip, entry as GuestReg)
-            .expect("set RIP");
-        qemu.write_reg(Regs::Sp, sp as GuestReg)
-            .expect("set RSP");
-        qemu.write_reg(Regs::Rdi, buffer as GuestReg)
-            .expect("set RDI");
-        qemu.write_reg(Regs::Rsi, size as GuestReg)
-            .expect("set RSI");
+        // SnapshotModule::reset restores guest RAM, mappings, mprotect
+        // states, brk and mmap layout — but NOT the CPU. Restore the
+        // complete architectural CPU state captured at the entry
+        // breakpoint so re-execution starts from a state identical to the
+        // first run (any harness, any calling convention). LibAFL
+        // breakpoints live outside the env struct, so the armed
+        // return-address breakpoint survives the restore.
+        cpu.restore_state(&saved_cpu);
 
         // Start a fresh trace (the previous iteration's trace was consumed).
         // SAFETY: runtime lives in this process.
@@ -201,8 +231,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // === 3b. write the input into the guest buffer ===
+        // Restore the FULL buffer to snapshot-time content first, then
+        // overlay the input (see snapshot_buffer comment above).
         let len = input.len().min(size as usize).min(4096);
-        qemu.write_mem(buffer, &input[..len]).expect("write input to guest buffer");
+        let mut guest_buffer = snapshot_buffer.clone();
+        guest_buffer[..len].copy_from_slice(&input[..len]);
+        qemu.write_mem(buffer, &guest_buffer)
+            .expect("write input to guest buffer");
 
         // === 3c. mark the input-length prefix symbolic (g2h inside module) ===
         emulator
@@ -229,7 +264,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // header so the observer can read the trace of this execution.
         unsafe { _libafl_concolic_end_trace() };
 
-        let mut observer = ConcolicObserver::new("concolic", concolic_shmem.as_slice_mut());
+        let observer = ConcolicObserver::new("concolic", concolic_shmem.as_slice_mut());
         let metadata = observer.create_metadata_from_current_map();
         let msgs = metadata.iter_messages().count();
         log::info!("trace: {msgs} symbolic expressions");

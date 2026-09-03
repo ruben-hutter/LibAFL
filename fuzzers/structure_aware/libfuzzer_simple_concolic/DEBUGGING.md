@@ -1,7 +1,31 @@
 # Debugging the restored-execution constraint loss — RESOLVED
 
-**Status: FIXED** (see commits `91670909` and `e29b3739`). Kept for the
-postmortem.
+**Status: FIXED** (see commits `91670909` and `e29b3739`, plus the
+follow-ups below). Kept for the postmortem.
+
+## Follow-up fix 2: stale input-buffer tail (crash after crash / writer panic)
+
+Symptom: after a traced input crashed the guest (Z3-solved NULL deref), a
+LATER, shorter input with the "QEMU" prefix "impossibly" crashed too — with
+a full crash-path trace — and in the fuzzer a `make_relative` unwrap panic
+(`serialization_format.rs`) killed the process.
+
+Root cause: the guest input buffer is only ever written **host-side**
+(`qemu.write_mem`), which bypasses `SnapshotModule`'s hook-based dirty-page
+tracking. `reset()` therefore never restores that page, and bytes in
+`[len, buffer_size)` leaked in from the previously traced input. A crashing
+input leaves the exact solution bytes (`42 13 37 e9 14 7f 80`) there, so
+the next short "QEMU"-prefixed input re-solved the chain with stale data.
+Trace contents then depended on execution history — including expression
+references the per-trace writer could not resolve (ids collide with the
+rewound id counter → the unwrap panic).
+
+Fix: capture the buffer content at the entry breakpoint and restore the
+FULL buffer to snapshot-time state before overlaying each input
+(fuzzer + snapshot_runner). Verified with a crash→short-input sequence in
+the smoke test (deterministic traces, no spurious crash), a 300-iteration
+random-length chaos run during debugging, and 1100+ fuzzer traces with
+zero panics.
 
 ## Follow-up fix: in-process crash handling (`e29b3739`)
 
@@ -55,6 +79,34 @@ The per-iteration `libafl_flush_jit()` is dropped (translated blocks carry
 no persistent symbolic state; the env_exprs region and shadow pages are
 zeroed via `_libafl_sym_reset_state` before re-marking, which keeps
 expression ids consistent with the per-trace writer rewind).
+
+## Generalization: full CPU-state snapshot (supersedes the 4-register fix)
+
+Rewriting four registers only re-establishes the SysV argument/stack state
+of THAT harness. To hold for every possible harness, each iteration must
+restart from the complete state the first execution started from:
+
+- **CPU**: `CPU::save_state()` / `CPU::restore_state()` (libafl_qemu) memcpy
+  the whole bindgen'd `CPUArchState` (`CPUX86State`) captured at the entry
+  breakpoint. That is the full architectural state: all 16 GPRs, RIP,
+  RFLAGS, segment registers **with bases** (FS/GS → TLS), GDT/IDT/LDT/TSS,
+  CR/DR registers, x87 FPU stack + control/status, XMM/YMM, MXCSR, MSRs,
+  and TCG-internal lazy-flag fields (`cc_op`/`cc_src`/`cc_dst`). It is a
+  pure data struct in a linux-user TCG build (the only pointers are
+  hardware-debug-register breakpoint/watchpoint slots, NULL unless the
+  guest uses dr0-dr3, and static cache-model data), so memcpy save/restore
+  is sound. LibAFL's own breakpoints live in a global list outside the env
+  struct, so the armed return-address breakpoint survives the restore.
+- **Memory**: `SnapshotModule::reset` already covers it completely — all
+  guest RAM pages (stack, heap, globals, data), the mmap layout (regions
+  created after the snapshot are unmapped, unmapped ones re-mapped with
+  their original permissions) and the brk.
+
+Known remaining limits (inherent to user-mode snapshot re-execution, not to
+the register fix): harnesses that spawn threads or modify the guest signal
+mask *inside* the snapshot region are not rolled back (thread states live
+in QEMU `TaskState`, not the env), and inherently non-deterministic
+syscalls (time, randomness) stay non-deterministic.
 
 ## Verification
 
